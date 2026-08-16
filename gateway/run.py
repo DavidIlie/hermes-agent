@@ -1132,16 +1132,23 @@ def build_resume_recovery_note(
     )
     if operator_replay:
         resume_guidance = (
-            "Review the conversation history and complete the user's unresolved "
-            "request without asking them to repeat it. Treat any prior failure or "
-            "blocker report as evidence from an incomplete attempt, not as task "
-            "completion."
+            "This is an explicit current command from the authorized operator, "
+            "not a presence check or status notification. Review the conversation "
+            "history, identify the most recent still-unfulfilled user objective, "
+            "and execute it now using the available tools. Do not ask the user to "
+            "repeat it. Ignore any immediately preceding automatic recovery "
+            "greeting that asks what to do; that greeting was a failed replay. "
+            "Treat any prior failure or blocker report as evidence from an "
+            "incomplete attempt, not as task completion."
         )
         tail_guidance = (
             "Do NOT repeat successful state-changing actions; verify current state, "
             "then retry failed or missing steps. Preserve every normal approval "
             "gate. Never quote or expose secrets from history; use configured "
-            "credential stores when available."
+            "credential stores when available. Your response must not be a greeting, "
+            "a presence acknowledgement, or a question asking what to do. If the "
+            "original request required no mutation and was already answered, verify "
+            "or re-answer it directly instead of asking for a new request."
         )
     elif message:
         resume_guidance = (
