@@ -1120,14 +1120,30 @@ def build_resume_recovery_note(
     silently abandoned behind a "restored" acknowledgement that goes
     nowhere (#57056).
     """
+    operator_replay = reason == "operator_replay" and not message
     reason_phrase = (
-        "a gateway restart"
+        "an operator-requested recovery"
+        if reason == "operator_replay"
+        else "a gateway restart"
         if reason == "restart_timeout"
         else "a gateway shutdown"
         if reason == "shutdown_timeout"
         else "a gateway interruption"
     )
-    if message:
+    if operator_replay:
+        resume_guidance = (
+            "Review the conversation history and complete the user's unresolved "
+            "request without asking them to repeat it. Treat any prior failure or "
+            "blocker report as evidence from an incomplete attempt, not as task "
+            "completion."
+        )
+        tail_guidance = (
+            "Do NOT repeat successful state-changing actions; verify current state, "
+            "then retry failed or missing steps. Preserve every normal approval "
+            "gate. Never quote or expose secrets from history; use configured "
+            "credential stores when available."
+        )
+    elif message:
         resume_guidance = (
             "Address the user's NEW message below FIRST and focus "
             "on what the user is asking now."
@@ -10914,9 +10930,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # force-interrupted; "restart_interrupted" is set by
     # SessionStore.suspend_recently_active() on crash recovery (no
     # .clean_shutdown marker).  All three mean "the agent was mid-turn and
-    # we killed it" — eligible for startup auto-resume.
+    # we killed it" — eligible for startup auto-resume. ``operator_replay``
+    # is an explicit, operator-written marker used for a bounded recovery
+    # migration; it is never inferred from a normal user message.
     _AUTO_RESUME_REASONS = frozenset(
-        {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
+        {
+            "restart_timeout",
+            "shutdown_timeout",
+            "restart_interrupted",
+            "operator_replay",
+        }
     )
 
     async def _run_startup_resume_event(

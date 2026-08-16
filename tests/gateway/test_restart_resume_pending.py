@@ -41,6 +41,7 @@ from gateway.run import (
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
     _should_clear_resume_pending_after_turn,
+    GatewayRunner,
     build_resume_recovery_note,
 )
 from gateway.session import SessionEntry, SessionSource, SessionStore
@@ -312,6 +313,26 @@ class TestResumePendingSystemNote:
         assert "skip any unfinished work" not in note
         # But still guards against re-running already-recorded tool calls.
         assert "already appear in the history" in note
+
+    def test_operator_replay_retries_unresolved_work_without_duplication(self):
+        """An operator-requested replay must work on interactive threads.
+
+        This is deliberately different from crash recovery: the operator has
+        explicitly asked Hermes to revisit the failed turn, so Discord must
+        continue the work without asking the user to resend it.  Completed
+        state-changing calls remain protected from duplicate execution.
+        """
+        note = build_resume_recovery_note("operator_replay", "", interactive=True)
+
+        assert "complete the user's unresolved request" in note
+        assert "ask what they would like to do next" not in note
+        assert "Do NOT repeat successful state-changing actions" in note
+        assert "retry failed or missing steps" in note
+        assert "approval" in note
+        assert "secret" in note
+
+    def test_operator_replay_is_startup_resumable(self):
+        assert "operator_replay" in GatewayRunner._AUTO_RESUME_REASONS
 
 
     def test_resume_pending_fires_without_tool_tail(self):
@@ -1038,5 +1059,3 @@ async def test_startup_restore_gate_releases_when_resume_turn_outlives_timeout(
 
     never_finishes.set()
     await slow_task
-
-
