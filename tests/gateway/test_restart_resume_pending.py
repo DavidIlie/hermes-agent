@@ -341,6 +341,15 @@ class TestResumePendingSystemNote:
     def test_operator_replay_is_startup_resumable(self):
         assert "operator_replay" in GatewayRunner._AUTO_RESUME_REASONS
 
+    def test_operator_replay_stays_user_level_with_pending_context(self):
+        note = build_resume_recovery_note(
+            "operator_replay", "The configured model was refreshed.", interactive=True
+        )
+
+        assert note.startswith("David's current request")
+        assert "Additional current context:" in note
+        assert note.endswith("The configured model was refreshed.")
+
 
     def test_resume_pending_fires_without_tool_tail(self):
         """Key improvement over PR #9934: the restart-resume note fires

@@ -1120,13 +1120,13 @@ def build_resume_recovery_note(
     silently abandoned behind a "restored" acknowledgement that goes
     nowhere (#57056).
     """
-    operator_replay = reason == "operator_replay" and not message
+    operator_replay = reason == "operator_replay"
     if operator_replay:
         # This is intentionally an ordinary user-level command. Wrapping an
         # internal event in a user-authored "[System note]" makes a
         # prompt-injection-aware model correctly distrust the claimed role and
         # can degrade into a generic greeting instead of recovery work.
-        return (
+        command = (
             "David's current request is to continue the unfinished work in this "
             "thread now. Review the conversation history, identify the most recent "
             "still-unfulfilled user objective, and execute it now using the available "
@@ -1142,6 +1142,9 @@ def build_resume_recovery_note(
             "request required no mutation and was already answered, verify or "
             "re-answer it directly instead of asking for a new request."
         )
+        if message:
+            command += "\n\nAdditional current context:\n" + message
+        return command
     reason_phrase = (
         "an operator-requested recovery"
         if reason == "operator_replay"
