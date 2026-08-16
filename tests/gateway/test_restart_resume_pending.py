@@ -314,6 +314,14 @@ class TestResumePendingSystemNote:
         # But still guards against re-running already-recorded tool calls.
         assert "already appear in the history" in note
 
+    def test_empty_message_interactive_note_continues_or_stays_silent(self):
+        note = build_resume_recovery_note("restart_timeout", "", interactive=True)
+        assert "CONTINUE the interrupted task" in note
+        assert "NO_REPLY" in note
+        assert "ask what they would like to do next" not in note
+        assert "skip any unfinished work" not in note
+        assert "already appear in the history" in note
+
     def test_operator_replay_retries_unresolved_work_without_duplication(self):
         """An operator-requested replay must work on interactive threads.
 
@@ -332,7 +340,8 @@ class TestResumePendingSystemNote:
         assert "ask what they would like to do next" not in note
         assert "Do not reply with a greeting" in note
         assert "question asking what to do" in note
-        assert "verify or re-answer it directly" in note
+        assert "already fully satisfied" in note
+        assert "NO_REPLY" in note
         assert "Do NOT repeat successful state-changing actions" in note
         assert "retry failed or missing steps" in note
         assert "approval" in note

@@ -7,6 +7,7 @@ conversation history.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from typing import Any
 
@@ -118,6 +119,37 @@ def is_intentional_silence_agent_result(agent_result: dict | None, response: Any
     if agent_result.get("failed"):
         return False
     return is_intentional_silence_response(response)
+
+
+def is_generic_resume_greeting(response: Any) -> bool:
+    """Recognize only empty-task greetings emitted by synthetic resume turns.
+
+    Callers must additionally prove the inbound event was internal and had no
+    user-authored text. Substantive replies and ordinary turns stay visible.
+    """
+    if not isinstance(response, str):
+        return False
+    stripped = response.strip()
+    if not stripped or len(stripped) > 240 or "\n" in stripped:
+        return False
+
+    normalized = stripped.casefold().replace("’", "'")
+    normalized = re.sub(r"['’]", "", normalized)
+    words = " ".join(re.findall(r"[a-z0-9]+", normalized))
+    greeting = r"(?:(?:hi|hello|hey)(?: [a-z0-9]+)?|im here)"
+    question = (
+        r"(?:what would you like(?: me)? to (?:do|work on|check)|"
+        r"what would you like help with|what can i help you with|"
+        r"how can i help(?: you)?|"
+        r"what do you want(?: me)? to (?:do|work on|check|help with))"
+    )
+    patterns = (
+        greeting,
+        rf"(?:{greeting} )?{question}(?: today)?",
+        r"(?:im )?ready when you are",
+        r"send me (?:a|your) (?:question|task|question or task) whenever youre ready",
+    )
+    return any(re.fullmatch(pattern, words) for pattern in patterns)
 
 
 def is_partial_silence_marker(text: Any) -> bool:

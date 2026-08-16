@@ -1112,13 +1112,9 @@ def build_resume_recovery_note(
     startup auto-resume turn synthesized by
     ``_schedule_resume_pending_sessions`` with no human message attached.
 
-    ``interactive`` selects the empty-message guidance: on interactive
-    platforms a human is present, so "report the restore and ask what next"
-    is right.  On non-interactive event platforms (webhook, API server —
-    adapters with ``interactive_resume = False``) nobody can answer; the
-    resumed turn must instead complete the interrupted work, or the task is
-    silently abandoned behind a "restored" acknowledgement that goes
-    nowhere (#57056).
+    ``interactive`` only changes the platform phrasing. Empty synthetic turns
+    always continue unfinished work and stay silent when nothing remains;
+    they never ask the user what to do next.
     """
     operator_replay = reason == "operator_replay"
     if operator_replay:
@@ -1138,9 +1134,9 @@ def build_resume_recovery_note(
             "failed or missing steps only. Preserve every normal approval gate. "
             "Never quote or expose secrets from history; use configured credential "
             "stores when available. Do not reply with a greeting, a presence "
-            "acknowledgement, or a question asking what to do. If the original "
-            "request required no mutation and was already answered, verify or "
-            "re-answer it directly instead of asking for a new request."
+            "acknowledgement, or a question asking what to do. If verification "
+            "shows the original request is already fully satisfied, emit exactly "
+            "NO_REPLY. Otherwise continue the missing work and report the result."
         )
         if message:
             command += "\n\nAdditional current context:\n" + message
@@ -1165,12 +1161,13 @@ def build_resume_recovery_note(
         )
     elif interactive:
         resume_guidance = (
-            "Report to the user that the session was restored "
-            "successfully and ask what they would like to do next."
+            "Review the conversation history and CONTINUE the interrupted task. "
+            "Do not emit a session-restored acknowledgement or ask what to do. "
+            "If no unfinished work remains after verification, emit exactly NO_REPLY."
         )
         tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any "
-            "unfinished work from the conversation history."
+            "Do NOT re-run tool calls whose results already appear in the history — "
+            "resume from the first step that has no recorded result."
         )
     else:
         resume_guidance = (
@@ -5002,9 +4999,9 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
-        _want_stream_deltas = _streaming_enabled
+        _want_stream_deltas = _streaming_enabled and not ctx.suppress_streaming_output
         _want_interim_messages = ctx.interim_assistant_messages_enabled
-        _want_interim_consumer = _want_interim_messages
+        _want_interim_consumer = _want_interim_messages and not ctx.suppress_streaming_output
         if _want_stream_deltas or _want_interim_consumer:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
@@ -5044,7 +5041,11 @@ class TurnRunner:
         # When text streaming is off but streaming TTS is active,
         # install a TTS-only delta callback so the consumer still
         # receives LLM deltas for audio synthesis (#60671).
-        if _stream_delta_cb is None and _stts_consumer_ref is not None:
+        if (
+            _stream_delta_cb is None
+            and _stts_consumer_ref is not None
+            and not ctx.suppress_streaming_output
+        ):
             def _stream_delta_cb(text: str) -> None:
                 if ctx._run_still_current():
                     _stts_consumer_ref.on_delta(text)
@@ -19024,6 +19025,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                suppress_streaming_output=bool(
+                    getattr(event, "internal", False)
+                    and not str(getattr(event, "text", "") or "").strip()
+                ),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -19074,7 +19079,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
                 response = ""
             try:
-                from gateway.response_filters import is_intentional_silence_agent_result
+                from gateway.response_filters import (
+                    SILENT_REPLY_TOKEN,
+                    is_generic_resume_greeting,
+                    is_intentional_silence_agent_result,
+                )
+                _synthetic_empty_internal = bool(
+                    getattr(event, "internal", False)
+                    and not str(getattr(event, "text", "") or "").strip()
+                )
+                if (
+                    _synthetic_empty_internal
+                    and not agent_result.get("failed")
+                    and is_generic_resume_greeting(response)
+                ):
+                    logger.info(
+                        "Suppressing generic synthetic-resume greeting for session %s",
+                        session_entry.session_id,
+                    )
+                    response = SILENT_REPLY_TOKEN
+                    agent_result["final_response"] = SILENT_REPLY_TOKEN
+                    for _message in reversed(agent_result.get("messages") or []):
+                        if (
+                            isinstance(_message, dict)
+                            and _message.get("role") == "assistant"
+                            and is_generic_resume_greeting(_message.get("content"))
+                        ):
+                            _message["content"] = SILENT_REPLY_TOKEN
+                            break
                 _intentional_silence = is_intentional_silence_agent_result(
                     agent_result, response,
                 )
@@ -25706,6 +25738,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        suppress_streaming_output: bool = False,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -25810,7 +25843,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _scfg.enabled and _scfg.transport != "off"
             if _plat_streaming is None
             else bool(_plat_streaming)
-        )
+        ) and not suppress_streaming_output
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
@@ -25997,6 +26030,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        suppress_streaming_output: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -26016,6 +26050,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                suppress_streaming_output=suppress_streaming_output,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -26028,6 +26063,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                suppress_streaming_output=suppress_streaming_output,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -26170,6 +26206,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        suppress_streaming_output: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -26194,6 +26231,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                suppress_streaming_output=suppress_streaming_output,
             )
 
         from run_agent import AIAgent
@@ -26476,6 +26514,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            suppress_streaming_output=suppress_streaming_output,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to

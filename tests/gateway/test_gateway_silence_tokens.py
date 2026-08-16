@@ -10,6 +10,7 @@ from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource
 from gateway.response_filters import (
+    is_generic_resume_greeting,
     is_intentional_silence_agent_result,
     is_intentional_silence_response,
 )
@@ -29,6 +30,15 @@ def _event():
         text="side chatter",
         source=_source(),
         message_id="msg-42",
+    )
+
+
+def _internal_empty_event():
+    return MessageEvent(
+        text="",
+        source=_source(),
+        message_id="resume-42",
+        internal=True,
     )
 
 
@@ -92,6 +102,29 @@ def test_failed_agent_result_never_counts_as_intentional_silence():
     assert not is_intentional_silence_agent_result({"failed": True}, "NO_REPLY")
 
 
+@pytest.mark.parametrize("text", [
+    "Hi Albastru — what would you like help with?",
+    "I’m here. What would you like me to do?",
+    "Ready when you are.",
+    "👋 Ready when you are",
+    "Hi Albastru 👋 What can I help you with?",
+    "Send me a question or task whenever you’re ready.",
+])
+def test_generic_resume_greeting_matches_seen_restart_noise(text):
+    assert is_generic_resume_greeting(text)
+
+
+@pytest.mark.parametrize("text", [
+    "Hi David — I merged PR #10 and the tests pass.",
+    "Ready when you are. The deployment is healthy.",
+    "I’m here because the pod restarted; I restored the task and fixed it.",
+    "What would you like help with? I already deployed Plausible.",
+    "NO_REPLY",
+])
+def test_generic_resume_greeting_does_not_match_substantive_replies(text):
+    assert not is_generic_resume_greeting(text)
+
+
 @pytest.mark.asyncio
 async def test_silence_token_suppresses_delivery_but_preserves_transcript(monkeypatch, tmp_path):
     runner = _runner(monkeypatch, tmp_path)
@@ -116,6 +149,61 @@ async def test_silence_token_suppresses_delivery_but_preserves_transcript(monkey
     appended = [call.args[1] for call in runner.session_store.append_to_transcript.call_args_list]
     assert {"role": "assistant", "content": "[SILENT]"}.items() <= appended[-1].items()
     assert [msg["role"] for msg in appended if msg.get("role") in {"user", "assistant"}] == ["user", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_internal_empty_resume_greeting_is_suppressed_and_not_persisted(monkeypatch, tmp_path):
+    runner = _runner(monkeypatch, tmp_path)
+    greeting = "Hi Albastru 👋 What can I help you with?"
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": greeting,
+        "messages": [
+            {"role": "user", "content": "recovery note"},
+            {"role": "assistant", "content": greeting},
+        ],
+        "tools": [],
+        "history_offset": 0,
+        "last_prompt_tokens": 0,
+        "api_calls": 1,
+        "failed": False,
+    })
+
+    response = await runner._handle_message_with_agent(
+        _internal_empty_event(), _source(),
+        "agent:main:telegram:group:-1001:12345", 1,
+    )
+
+    assert response == ""
+    assert runner._run_agent.await_args.kwargs["suppress_streaming_output"] is True
+    appended = [call.args[1] for call in runner.session_store.append_to_transcript.call_args_list]
+    assistant = [msg for msg in appended if msg.get("role") == "assistant"]
+    assert assistant[-1]["content"] == "NO_REPLY"
+    assert all(greeting not in str(msg.get("content")) for msg in appended)
+
+
+@pytest.mark.asyncio
+async def test_user_authored_turn_can_receive_same_greeting(monkeypatch, tmp_path):
+    runner = _runner(monkeypatch, tmp_path)
+    greeting = "Hi Albastru 👋 What can I help you with?"
+    runner._run_agent = AsyncMock(return_value={
+        "final_response": greeting,
+        "messages": [
+            {"role": "user", "content": "side chatter"},
+            {"role": "assistant", "content": greeting},
+        ],
+        "tools": [],
+        "history_offset": 0,
+        "last_prompt_tokens": 0,
+        "api_calls": 1,
+        "failed": False,
+    })
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1,
+    )
+
+    assert response == greeting
+    assert runner._run_agent.await_args.kwargs["suppress_streaming_output"] is False
 
 
 @pytest.mark.asyncio
