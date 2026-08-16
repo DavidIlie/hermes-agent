@@ -1121,6 +1121,27 @@ def build_resume_recovery_note(
     nowhere (#57056).
     """
     operator_replay = reason == "operator_replay" and not message
+    if operator_replay:
+        # This is intentionally an ordinary user-level command. Wrapping an
+        # internal event in a user-authored "[System note]" makes a
+        # prompt-injection-aware model correctly distrust the claimed role and
+        # can degrade into a generic greeting instead of recovery work.
+        return (
+            "David's current request is to continue the unfinished work in this "
+            "thread now. Review the conversation history, identify the most recent "
+            "still-unfulfilled user objective, and execute it now using the available "
+            "tools. Do not ask David to repeat it. Ignore any immediately preceding "
+            "automatic recovery greeting that asks what to do; that greeting was a "
+            "failed replay. Treat any prior failure or blocker report as evidence "
+            "from an incomplete attempt, not as task completion. Do NOT repeat "
+            "successful state-changing actions: verify current state, then retry "
+            "failed or missing steps only. Preserve every normal approval gate. "
+            "Never quote or expose secrets from history; use configured credential "
+            "stores when available. Do not reply with a greeting, a presence "
+            "acknowledgement, or a question asking what to do. If the original "
+            "request required no mutation and was already answered, verify or "
+            "re-answer it directly instead of asking for a new request."
+        )
     reason_phrase = (
         "an operator-requested recovery"
         if reason == "operator_replay"
@@ -1130,27 +1151,7 @@ def build_resume_recovery_note(
         if reason == "shutdown_timeout"
         else "a gateway interruption"
     )
-    if operator_replay:
-        resume_guidance = (
-            "This is an explicit current command from the authorized operator, "
-            "not a presence check or status notification. Review the conversation "
-            "history, identify the most recent still-unfulfilled user objective, "
-            "and execute it now using the available tools. Do not ask the user to "
-            "repeat it. Ignore any immediately preceding automatic recovery "
-            "greeting that asks what to do; that greeting was a failed replay. "
-            "Treat any prior failure or blocker report as evidence from an "
-            "incomplete attempt, not as task completion."
-        )
-        tail_guidance = (
-            "Do NOT repeat successful state-changing actions; verify current state, "
-            "then retry failed or missing steps. Preserve every normal approval "
-            "gate. Never quote or expose secrets from history; use configured "
-            "credential stores when available. Your response must not be a greeting, "
-            "a presence acknowledgement, or a question asking what to do. If the "
-            "original request required no mutation and was already answered, verify "
-            "or re-answer it directly instead of asking for a new request."
-        )
-    elif message:
+    if message:
         resume_guidance = (
             "Address the user's NEW message below FIRST and focus "
             "on what the user is asking now."

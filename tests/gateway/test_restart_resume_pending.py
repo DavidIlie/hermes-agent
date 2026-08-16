@@ -324,12 +324,13 @@ class TestResumePendingSystemNote:
         """
         note = build_resume_recovery_note("operator_replay", "", interactive=True)
 
-        assert "explicit current command from the authorized operator" in note
+        assert note.startswith("David's current request")
+        assert not note.startswith("[System note:")
         assert "identify the most recent still-unfulfilled user objective" in note
         assert "execute it now using the available tools" in note
         assert "failed replay" in note
         assert "ask what they would like to do next" not in note
-        assert "must not be a greeting" in note
+        assert "Do not reply with a greeting" in note
         assert "question asking what to do" in note
         assert "verify or re-answer it directly" in note
         assert "Do NOT repeat successful state-changing actions" in note
