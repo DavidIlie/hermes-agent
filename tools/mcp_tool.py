@@ -4035,14 +4035,14 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
 
         answer = request_elicitation_consent(
             (
-                f"MCP tool '{tool_name}' on UNTRUSTED server "
-                f"'{server_name}' wants to run. This tool is write-capable "
-                f"(no readOnlyHint=true annotation) and may modify external "
-                f"state."
+                f"MCP tool '{tool_name}' on approval-gated server "
+                f"'{server_name}' wants to run. This tool may modify "
+                f"external state."
             ),
             (
-                f"Server '{server_name}' is configured 'trust: untrusted'. "
-                f"Approve to run '{tool_name}' once, or deny to block it."
+                f"Operator policy requires your confirmation for writes on "
+                f"'{server_name}'. Approve to run '{tool_name}' once, or "
+                f"deny to block it."
             ),
             surface=f"mcp-trust/{server_name}",
         )
@@ -4052,7 +4052,7 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
             server_name, tool_name, exc, exc_info=True,
         )
         return tool_error(
-            f"MCP tool '{tool_name}' on untrusted server '{server_name}' "
+            f"MCP tool '{tool_name}' on approval-gated server '{server_name}' "
             f"was blocked: the approval system was unavailable "
             f"(fail-closed)."
         )
@@ -4066,7 +4066,7 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
     )
     return tool_error(
         f"The user did not approve running write-capable MCP tool "
-        f"'{tool_name}' on untrusted server '{server_name}'. The command "
+        f"'{tool_name}' on approval-gated server '{server_name}'. The command "
         f"was NOT run. Do not retry without explicit user direction."
     )
 

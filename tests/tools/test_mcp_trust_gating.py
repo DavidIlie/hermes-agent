@@ -101,6 +101,11 @@ class TestTrustGateAtCallTime:
         ) as consent:
             raw = handler({"repo": "x"})
         consent.assert_called_once()
+        prompt, reason = consent.call_args.args[:2]
+        assert "approval-gated server" in prompt
+        assert "Operator policy requires your confirmation" in reason
+        assert "UNTRUSTED" not in prompt
+        assert "trust: untrusted" not in reason
         assert json.loads(raw) == {"result": "ok"}
         fake_session.call_tool.assert_awaited_once()
 
