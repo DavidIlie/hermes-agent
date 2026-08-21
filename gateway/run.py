@@ -5706,17 +5706,31 @@ class TurnRunner:
             # false positives from MagicMock auto-attribute creation in tests.
             if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
                 try:
+                    approval_kwargs = {
+                        "chat_id": ctx._status_chat_id,
+                        "command": cmd,
+                        "session_key": _approval_session_key,
+                        "description": desc,
+                        "metadata": ctx._status_thread_metadata,
+                        "allow_permanent": approval_data.get("allow_permanent", True),
+                        "allow_session": approval_data.get("allow_session", True),
+                        "smart_denied": approval_data.get("smart_denied", False),
+                    }
+                    try:
+                        approval_parameters = inspect.signature(
+                            type(ctx._status_adapter).send_exec_approval
+                        ).parameters
+                    except (TypeError, ValueError):
+                        approval_parameters = {}
+                    action_label = str(approval_data.get("action_label") or "").strip()
+                    if action_label and "action_label" in approval_parameters:
+                        approval_kwargs["action_label"] = action_label
+                    if "require_explicit_user" in approval_parameters:
+                        approval_kwargs["require_explicit_user"] = bool(
+                            approval_data.get("require_explicit_user", False)
+                        )
                     _approval_fut = safe_schedule_threadsafe(
-                        ctx._status_adapter.send_exec_approval(
-                            chat_id=ctx._status_chat_id,
-                            command=cmd,
-                            session_key=_approval_session_key,
-                            description=desc,
-                            metadata=ctx._status_thread_metadata,
-                            allow_permanent=approval_data.get("allow_permanent", True),
-                            allow_session=approval_data.get("allow_session", True),
-                            smart_denied=approval_data.get("smart_denied", False),
-                        ),
+                        ctx._status_adapter.send_exec_approval(**approval_kwargs),
                         ctx._loop_for_step,
                         logger=logger,
                         log_message="send_exec_approval scheduling error",

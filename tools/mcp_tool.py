@@ -3955,6 +3955,7 @@ _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 # byte-stable and prompt caching is preserved.
 _server_trust_levels: Dict[str, str] = {}
 _tool_read_only_hints: Dict[str, Dict[str, bool]] = {}
+_tool_action_labels: Dict[str, Dict[str, str]] = {}
 
 _TRUST_FULL = "full"
 _TRUST_UNTRUSTED = "untrusted"
@@ -4008,10 +4009,13 @@ def _record_tool_trust_metadata(
             (config or {}).get("trust")
         )
         hints = _tool_read_only_hints.setdefault(server_name, {})
+        labels = _tool_action_labels.setdefault(server_name, {})
         for tool in tools:
             name = getattr(tool, "name", None)
             if name:
                 hints[name] = _annotation_read_only_hint(tool)
+                title = str(getattr(tool, "title", "") or "").strip()
+                labels[name] = title or name
 
 
 def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
@@ -4045,6 +4049,7 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
                 f"deny to block it."
             ),
             surface=f"mcp-trust/{server_name}",
+            action_label=_tool_action_labels.get(server_name, {}).get(tool_name),
         )
     except Exception as exc:
         logger.error(

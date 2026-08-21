@@ -73,7 +73,8 @@ def fake_session():
 def _clean_trust_state():
     """Isolate the module-level trust metadata between tests."""
     with patch.dict(mcp_tool._server_trust_levels, {}, clear=True), \
-         patch.dict(mcp_tool._tool_read_only_hints, {}, clear=True):
+         patch.dict(mcp_tool._tool_read_only_hints, {}, clear=True), \
+         patch.dict(mcp_tool._tool_action_labels, {}, clear=True):
         yield
 
 
@@ -93,6 +94,7 @@ class TestTrustGateAtCallTime:
     ):
         """Approval consulted; 'accept' lets the RPC through."""
         _set_trust("srv", "untrusted")
+        mcp_tool._tool_action_labels["srv"] = {"delete_repo": "Delete repository"}
         # No readOnlyHint recorded for delete_repo → write-capable.
         handler = mcp_tool._make_tool_handler("srv", "delete_repo", 30.0)
         with patch(
@@ -106,6 +108,8 @@ class TestTrustGateAtCallTime:
         assert "Operator policy requires your confirmation" in reason
         assert "UNTRUSTED" not in prompt
         assert "trust: untrusted" not in reason
+        assert consent.call_args.kwargs["action_label"] == "Delete repository"
+        assert consent.call_args.kwargs.get("surface") == "mcp-trust/srv"
         assert json.loads(raw) == {"result": "ok"}
         fake_session.call_tool.assert_awaited_once()
 
@@ -201,9 +205,9 @@ class TestTrustNormalization:
 class TestAnnotationCaptureAtDiscovery:
     """_register_server_tools records trust + readOnlyHint metadata."""
 
-    def _make_tool(self, name, annotations=None):
+    def _make_tool(self, name, annotations=None, title=None):
         return SimpleNamespace(
-            name=name, description="", inputSchema=None,
+            name=name, title=title, description="", inputSchema=None,
             annotations=annotations,
         )
 
@@ -217,7 +221,7 @@ class TestAnnotationCaptureAtDiscovery:
                 "list_repos", SimpleNamespace(readOnlyHint=True)
             ),
             self._make_tool(
-                "delete_repo", SimpleNamespace(readOnlyHint=False)
+                "delete_repo", SimpleNamespace(readOnlyHint=False), "Delete repository"
             ),
             self._make_tool("no_annotations", None),
         ]
@@ -235,6 +239,8 @@ class TestAnnotationCaptureAtDiscovery:
         # Anything not exactly True is write-capable.
         assert not hints.get("delete_repo")
         assert not hints.get("no_annotations")
+        assert mcp_tool._tool_action_labels["srv"]["delete_repo"] == "Delete repository"
+        assert mcp_tool._tool_action_labels["srv"]["no_annotations"] == "no_annotations"
 
     def test_dict_annotations_supported(self):
         """Cached/JSON annotations arrive as plain dicts."""

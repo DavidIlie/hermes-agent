@@ -4834,6 +4834,7 @@ def request_elicitation_consent(
     *,
     timeout_seconds: int | None = None,
     surface: str = "mcp-elicitation",
+    action_label: str | None = None,
 ) -> str:
     """Route an MCP elicitation request to whichever approval surface owns
     the active session and return a normalized result.
@@ -4871,6 +4872,12 @@ def request_elicitation_consent(
             "description": description,
             "pattern_key": "mcp_elicitation",
             "pattern_keys": ["mcp_elicitation"],
+            # MCP trust confirms one exact tool call. Persisting that answer
+            # for a session or forever would silently widen the authority.
+            "allow_session": False,
+            "allow_permanent": False,
+            "action_label": str(action_label or "").strip() or None,
+            "require_explicit_user": True,
         }
         try:
             decision = _await_gateway_decision(

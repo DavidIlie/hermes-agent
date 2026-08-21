@@ -7419,6 +7419,8 @@ class DiscordAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        action_label: Optional[str] = None,
+        require_explicit_user: bool = False,
     ) -> SendResult:
         """
         Send a button-based exec approval prompt for a dangerous command.
@@ -7449,11 +7451,19 @@ class DiscordAdapter(BasePlatformAdapter):
             if len(reason_display) > reason_budget:
                 reason_display = reason_display[: reason_budget - 15] + "... [truncated]"
 
-            prompt_prefix = (
-                "⚠️ **Command Approval Required**\n\n"
-                "Do you want Hermes to run this command?\n\n"
-                "**Requested command:**\n```bash\n"
-            )
+            action_label = " ".join(str(action_label or "").split())[:80]
+            if action_label:
+                prompt_prefix = (
+                    f"**{action_label}**\n\n"
+                    "Confirm this one operation.\n\n"
+                    "**Requested action:**\n```text\n"
+                )
+            else:
+                prompt_prefix = (
+                    "⚠️ **Command Approval Required**\n\n"
+                    "Do you want Hermes to run this command?\n\n"
+                    "**Requested command:**\n```bash\n"
+                )
             if smart_denied:
                 prompt_prefix += "**Smart DENY:** owner override applies to this one operation only.\n\n"
             mention_content = self._approval_mention_content()
@@ -7477,7 +7487,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if len(embed_cmd_display) > max_embed_desc:
                 embed_cmd_display = embed_cmd_display[: max_embed_desc - 3] + "..."
             embed = discord.Embed(
-                title="⚠️ Command Approval Required",
+                title=action_label or "⚠️ Command Approval Required",
                 description=f"```\n{embed_cmd_display}\n```",
                 color=discord.Color.orange(),
             )
@@ -7495,6 +7505,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 allow_permanent=allow_permanent,
                 allow_session=allow_session,
                 smart_denied=smart_denied,
+                action_label=action_label,
+                require_explicit_user=require_explicit_user,
             )
 
             send_kwargs: Dict[str, Any] = {"content": content, "embed": embed, "view": view}
@@ -8762,6 +8774,8 @@ def _define_discord_view_classes() -> None:
             allow_permanent: bool = True,
             allow_session: bool = True,
             smart_denied: bool = False,
+            action_label: str = "",
+            require_explicit_user: bool = False,
         ):
             super().__init__(timeout=_read_discord_prompt_timeout())
             self.session_key = session_key
@@ -8775,11 +8789,19 @@ def _define_discord_view_classes() -> None:
                 str(a).strip() for a in (admin_user_ids or set()) if str(a).strip()
             }
             self.resolved = False
+            self.action_label = action_label
+            self.require_explicit_user = require_explicit_user
+            buttons = {
+                str(getattr(child, "label", "")): child for child in self.children
+            }
+            if action_label and "Allow Once" in buttons:
+                buttons["Allow Once"].label = action_label
             if smart_denied or not allow_session:
-                self.remove_item(self.allow_session)
-                self.remove_item(self.allow_always)
-            elif not allow_permanent:
-                self.remove_item(self.allow_always)
+                for label in ("Allow Session", "Always Allow"):
+                    if button := buttons.get(label):
+                        self.remove_item(button)
+            elif not allow_permanent and (button := buttons.get("Always Allow")):
+                self.remove_item(button)
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             """Verify the user clicking is authorized.
@@ -8791,6 +8813,17 @@ def _define_discord_view_classes() -> None:
             gate fails closed: if it's on but no admins are configured, nobody
             can approve (logged once so the misconfiguration is visible).
             """
+            if self.require_explicit_user:
+                try:
+                    user_id = str(getattr(interaction.user, "id", "") or "")
+                except Exception:
+                    user_id = ""
+                allowed = {
+                    str(value).strip()
+                    for value in (self.allowed_user_ids or set())
+                    if str(value).strip()
+                }
+                return bool(user_id and user_id in allowed)
             if not _component_check_auth(
                 interaction, self.allowed_user_ids, self.allowed_role_ids,
             ):
