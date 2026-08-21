@@ -5350,6 +5350,68 @@ def _mark_server_call_started(server: Any) -> None:
         mark_tool_call()
 
 
+_FLEET_TASK_PROVENANCE_ARG = "_hermes_provenance"
+
+
+def _with_trusted_fleet_task_provenance(
+    server_name: str,
+    tool_name: str,
+    args: dict,
+) -> dict:
+    """Attach authenticated Discord origin to ``fleet_tasks.task_start``.
+
+    The MCP argument object is model-controlled, including reserved-looking
+    keys. Remove any supplied provenance first, then source the replacement
+    exclusively from task-local gateway ContextVars. Environment fallback is
+    deliberately forbidden because it cannot prove which authenticated
+    session commissioned the call.
+    """
+    if server_name != "fleet_tasks" or tool_name != "task_start":
+        return args
+
+    prepared = dict(args or {})
+    prepared.pop(_FLEET_TASK_PROVENANCE_ARG, None)
+
+    try:
+        from gateway.session_context import get_bound_session_env
+    except Exception:
+        return prepared
+
+    platform = get_bound_session_env("HERMES_SESSION_PLATFORM")
+    if (platform or "").strip().lower() != "discord":
+        return prepared
+
+    chat_id = (get_bound_session_env("HERMES_SESSION_CHAT_ID") or "").strip()
+    thread_id = (get_bound_session_env("HERMES_SESSION_THREAD_ID") or "").strip()
+    parent_chat_id = (
+        get_bound_session_env("HERMES_SESSION_PARENT_CHAT_ID") or ""
+    ).strip()
+    guild_id = (get_bound_session_env("HERMES_SESSION_SCOPE_ID") or "").strip()
+    session_key = (get_bound_session_env("HERMES_SESSION_KEY") or "").strip()
+    user_id = (get_bound_session_env("HERMES_SESSION_USER_ID") or "").strip()
+    channel_id = parent_chat_id or chat_id
+
+    # A platform marker by itself is not useful provenance. The official
+    # Discord adapter always binds these three values for an admitted message;
+    # missing data means this is not a complete authenticated origin and must
+    # fall back to an unannotated task instead of forwarding a partial claim.
+    if not channel_id or not session_key or not user_id:
+        return prepared
+
+    provenance = {
+        "platform": "discord",
+        "channel_id": channel_id,
+        "session_key": session_key,
+        "user_id": user_id,
+    }
+    if guild_id:
+        provenance["guild_id"] = guild_id
+    if thread_id:
+        provenance["thread_id"] = thread_id
+    prepared[_FLEET_TASK_PROVENANCE_ARG] = provenance
+    return prepared
+
+
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """Return a sync handler that calls an MCP tool via the background loop.
 
@@ -5358,6 +5420,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        args = _with_trusted_fleet_task_provenance(
+            server_name, tool_name, args
+        )
+
         # Trust-tier gate (security boundary): write-capable tools on
         # servers configured ``trust: untrusted`` must be approved by the
         # user before ANY transport work happens — including the lazy
