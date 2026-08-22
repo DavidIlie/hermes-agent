@@ -1166,6 +1166,15 @@ class DiscordAdapter(BasePlatformAdapter):
         # Mirrors the Telegram #58563 fix. Entries are dropped on finalize.
         self._last_overflow_preview: Dict[tuple, str] = {}
         self._warned_fail_closed_default = False
+        # Fleet overlay: restart-safe owner approval cards for public friend
+        # code requests. The relay has no model-facing path and stays disabled
+        # unless its complete fixed-boundary config and two distinct secrets
+        # are present.
+        self._friend_code_relay = None
+        self._friend_code_state_store = None
+        self._friend_code_bindings: Dict[str, Any] = {}
+        self._friend_code_relay_task: Optional[asyncio.Task] = None
+        self._friend_code_relay_lock = asyncio.Lock()
 
     def _config_value(
         self, key: str, default: Any, *, env_key: Optional[str] = None
@@ -1319,6 +1328,11 @@ class DiscordAdapter(BasePlatformAdapter):
             # Users with ANY of these roles can interact with the bot.
             self._allowed_role_ids = self._get_allowed_roles()
 
+            # Resolve the owner-only friend-code relay inside this adapter's
+            # profile secret scope. Tokens remain in memory and are never
+            # persisted in the restart-safe button state.
+            self._configure_friend_code_relay()
+
             # Set up intents.
             # Message Content is required for normal text replies.
             # Server Members is only needed when the allowlist contains usernames
@@ -1372,6 +1386,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 **proxy_kwargs_for_bot(proxy_url),
             )
             adapter_self = self  # capture for closure
+            self._register_friend_code_persistent_views()
 
             # Register event handlers
             @self._client.event
@@ -1389,6 +1404,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 if adapter_self._missed_message_backfill_enabled():
                     adapter_self._ensure_missed_message_backfill_task()
+                adapter_self._ensure_friend_code_relay_task()
 
             @self._client.event
             async def on_message(message: DiscordMessage):
@@ -1463,6 +1479,10 @@ class DiscordAdapter(BasePlatformAdapter):
 
             self._running = True
             self._start_liveness_probe()
+            # The first on_ready callback runs before connect() marks the
+            # adapter running, so start the relay after readiness succeeds.
+            # Later Discord reconnects can still restart it from on_ready.
+            self._ensure_friend_code_relay_task()
             return True
 
         except asyncio.TimeoutError:
@@ -2147,6 +2167,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Cancel the liveness probe first so it can't fire a spurious fatal
         # error / reconnect while we're intentionally tearing the adapter down.
         await self._cancel_liveness_task()
+        await self._cancel_friend_code_relay_task()
         # Clean up all active voice connections *before* cancelling the bot task.
         # leave_voice_channel() ends in `await vc.disconnect()`, and discord.py's
         # VoiceClient.disconnect() sends a voice state update over the main
@@ -2193,6 +2214,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._post_connect_task = None
         self._liveness_task = None
         self._missed_message_backfill_task = None
+        self._friend_code_relay_task = None
 
         self._release_platform_lock()
 
@@ -7437,6 +7459,522 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return None
 
+    # ── friend public-code approval relay (Fleet overlay) ────────────────
+
+    def _configure_friend_code_relay(self) -> None:
+        """Load the fixed relay boundary and owner-only credentials.
+
+        This runs during ``connect()`` while the default profile's secret
+        scope is active. Missing or malformed configuration disables the
+        relay. It never falls back to a friend profile or process-global
+        credentials in multiplex mode.
+        """
+        self._friend_code_relay = None
+        self._friend_code_state_store = None
+        self._friend_code_bindings = {}
+        raw = getattr(self.config, "extra", {}).get("friend_code_approval")
+        if not isinstance(raw, dict):
+            return
+        enabled = str(raw.get("enabled", False)).strip().lower() in {
+            "true", "1", "yes", "on",
+        }
+        if not enabled:
+            return
+        from plugins.platforms.discord.friend_code_approval import (
+            FriendCodeBrokerClient,
+            FriendCodeRelayConfig,
+            FriendCodeRelayError,
+            FriendCodeStateStore,
+        )
+
+        try:
+            from agent.secret_scope import get_secret
+            from hermes_constants import get_hermes_home
+
+            relay_config = FriendCodeRelayConfig.from_mapping(raw)
+            delivery_token = (
+                get_secret("HERMES_FRIEND_CODE_DELIVERY_TOKEN") or ""
+            ).strip()
+            owner_token = (
+                get_secret("HERMES_FRIEND_CODE_OWNER_TOKEN") or ""
+            ).strip()
+            relay = FriendCodeBrokerClient(
+                relay_config,
+                delivery_token=delivery_token,
+                owner_token=owner_token,
+            )
+            store = FriendCodeStateStore(
+                get_hermes_home() / "gateway" / "friend_code_approvals.json",
+                relay_config,
+            )
+            bindings = store.load()
+        except Exception as exc:
+            error_name = (
+                str(exc)
+                if isinstance(exc, FriendCodeRelayError)
+                else type(exc).__name__
+            )
+            logger.error(
+                "[%s] Friend code approval relay is disabled: %s",
+                self.name,
+                error_name,
+            )
+            return
+        self._friend_code_relay = relay
+        self._friend_code_state_store = store
+        self._friend_code_bindings = bindings
+
+    def _save_friend_code_bindings(self) -> None:
+        store = self._friend_code_state_store
+        if store is None:
+            return
+        store.save(self._friend_code_bindings)
+
+    def _register_friend_code_persistent_views(self) -> None:
+        """Register exact pending buttons before Discord starts dispatching."""
+        client = self._client
+        relay = self._friend_code_relay
+        if client is None or relay is None or not hasattr(client, "add_view"):
+            return
+        for binding in list(self._friend_code_bindings.values()):
+            if binding.is_terminal or not binding.message_id:
+                continue
+            try:
+                view = FriendCodeApprovalView(
+                    adapter=self,
+                    event_id=binding.event_id,
+                    approve_custom_id=binding.button_custom_id(
+                        "approve", relay.owner_token
+                    ),
+                    deny_custom_id=binding.button_custom_id(
+                        "deny", relay.owner_token
+                    ),
+                )
+                client.add_view(view, message_id=int(binding.message_id))
+            except Exception:
+                logger.error(
+                    "[%s] Failed to restore friend approval event %s",
+                    self.name,
+                    binding.event_id,
+                    exc_info=True,
+                )
+
+    def _ensure_friend_code_relay_task(self) -> None:
+        if self._friend_code_relay is None or not self._running:
+            return
+        task = self._friend_code_relay_task
+        if task is not None and not task.done():
+            return
+        task = asyncio.create_task(
+            self._friend_code_relay_loop(),
+            name=f"discord-friend-code-relay:{self.name}",
+        )
+        task.add_done_callback(_consume_background_task_result)
+        self._friend_code_relay_task = task
+
+    async def _cancel_friend_code_relay_task(self) -> None:
+        task = self._friend_code_relay_task
+        self._friend_code_relay_task = None
+        if task is None or task is asyncio.current_task():
+            return
+        if not task.done():
+            task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    async def _friend_code_relay_loop(self) -> None:
+        """Repair durable cards, then poll the broker without model turns."""
+        relay = self._friend_code_relay
+        if relay is None:
+            return
+        delay = relay.config.poll_interval_seconds
+        failures = 0
+        repaired = False
+        while self._running and not self._disconnecting:
+            try:
+                if not repaired:
+                    await self._repair_friend_code_bindings()
+                    repaired = True
+                await self._poll_friend_code_relay_once()
+                failures = 0
+                sleep_for = delay
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                failures += 1
+                sleep_for = min(60.0, delay * (2 ** min(failures, 4)))
+                logger.warning(
+                    "[%s] Friend code approval relay pass failed (%s); retrying in %.0fs",
+                    self.name,
+                    type(exc).__name__,
+                    sleep_for,
+                )
+            await asyncio.sleep(sleep_for)
+
+    async def _poll_friend_code_relay_once(self) -> None:
+        from plugins.platforms.discord.friend_code_approval import (
+            FriendCodeBinding,
+            FriendCodeRelayError,
+            validate_delivery_payload,
+            validate_status_receipt,
+        )
+
+        relay = self._friend_code_relay
+        if relay is None:
+            return
+        payload = await relay.notifications()
+        notifications, receipts = validate_delivery_payload(payload, relay.config)
+        async with self._friend_code_relay_lock:
+            for notification in notifications:
+                binding = FriendCodeBinding.from_notification(
+                    notification, relay.config
+                )
+                current = self._friend_code_bindings.get(binding.event_id)
+                if current is None:
+                    self._friend_code_bindings[binding.event_id] = binding
+                    self._save_friend_code_bindings()
+                    current = binding
+                elif not self._same_friend_code_binding(current, binding):
+                    raise FriendCodeRelayError(
+                        "notification identity changed after it was persisted"
+                    )
+                await self._ensure_friend_code_owner_card(current)
+                await relay.acknowledge(current)
+
+            for receipt in receipts:
+                event_id = str(receipt.get("event") or "")
+                binding = self._friend_code_bindings.get(event_id)
+                if binding is None:
+                    raise FriendCodeRelayError(
+                        "status receipt has no persisted approval card"
+                    )
+                state = validate_status_receipt(receipt, binding, relay.config)
+                binding.state = state
+                binding.decision = (
+                    "approve"
+                    if state == "approved_blocked"
+                    else "deny"
+                    if state == "denied"
+                    else ""
+                )
+                binding.updated_at = dt.datetime.now(dt.timezone.utc).isoformat().replace(
+                    "+00:00", "Z"
+                )
+                self._save_friend_code_bindings()
+                await self._ensure_friend_code_owner_card(binding)
+                await self._ensure_friend_code_status_delivery(binding)
+                await relay.acknowledge_receipt(binding, state)
+
+    @staticmethod
+    def _same_friend_code_binding(left: Any, right: Any) -> bool:
+        fields = (
+            "event_id",
+            "request_id",
+            "version",
+            "request_hash",
+            "kind",
+            "request",
+            "repository",
+            "new_repository_name",
+            "expires_at",
+            "friend_guild_id",
+            "friend_channel_id",
+            "friend_thread_id",
+            "friend_user_id",
+            "owner_guild_id",
+            "owner_channel_id",
+            "owner_user_id",
+        )
+        return all(getattr(left, field) == getattr(right, field) for field in fields)
+
+    async def _repair_friend_code_bindings(self) -> None:
+        if self._friend_code_relay is None:
+            return
+        async with self._friend_code_relay_lock:
+            for binding in list(self._friend_code_bindings.values()):
+                await self._ensure_friend_code_owner_card(binding)
+                if binding.is_terminal:
+                    await self._ensure_friend_code_status_delivery(binding)
+
+    async def _friend_code_owner_channel(self, binding: Any) -> Any:
+        if self._client is None:
+            raise RuntimeError("Discord is not connected")
+        channel = self._client.get_channel(int(binding.owner_channel_id))
+        if channel is None:
+            channel = await self._client.fetch_channel(int(binding.owner_channel_id))
+        guild_id = str(getattr(getattr(channel, "guild", None), "id", "") or "")
+        if guild_id != binding.owner_guild_id:
+            raise RuntimeError("Discord owner channel crossed its configured guild")
+        return channel
+
+    async def _find_friend_code_message(self, channel: Any, marker: str) -> Any:
+        history = getattr(channel, "history", None)
+        if history is None:
+            return None
+        try:
+            async for message in history(limit=100):
+                if marker in str(getattr(message, "content", "") or ""):
+                    return message
+        except Exception:
+            logger.debug(
+                "[%s] Could not search owner history for %s",
+                self.name,
+                marker,
+                exc_info=True,
+            )
+        return None
+
+    @staticmethod
+    def _friend_code_allowed_mentions() -> Any:
+        allowed_mentions = getattr(discord, "AllowedMentions", None)
+        if allowed_mentions is None:
+            return None
+        return allowed_mentions(
+            users=False,
+            roles=False,
+            everyone=False,
+            replied_user=False,
+        )
+
+    def _friend_code_owner_content(self, binding: Any) -> str:
+        if binding.kind == "existing_public":
+            repository = binding.repository or {}
+            branch = str(repository.get("default_branch", "unknown")).replace(
+                "`", "\u02cb"
+            )
+            target = (
+                f"[{repository.get('full_name', 'unknown')}](<{repository.get('url', '')}>) "
+                f"at `{branch}`"
+            )
+        else:
+            target = f"new isolated public repository `{binding.new_repository_name}`"
+        task = str(binding.request or "").replace("```", "`\u200b``")
+        header = (
+            "**Friend code request**\n\n"
+            f"Target: {target}\n"
+            f"Request: `{binding.request_id}` version `{binding.version}`\n"
+            f"Hash: `{binding.request_hash}`\n"
+            f"Expires: `{binding.expires_at}`\n\n"
+            "```text\n"
+        )
+        if binding.is_terminal:
+            footer = f"\n```\n\nStatus: **{binding.state.replace('_', ' ')}**\n{binding.marker}"
+        else:
+            footer = (
+                "\n```\n\nApproval records this exact public-only request. "
+                "It does not grant private repository access or start work.\n"
+                f"{binding.marker}"
+            )
+        budget = max(0, self.MAX_MESSAGE_LENGTH - len(header) - len(footer))
+        if len(task) > budget:
+            task = task[: max(0, budget - 16)] + "\n... [truncated]"
+        return header + task + footer
+
+    async def _ensure_friend_code_owner_card(self, binding: Any) -> None:
+        relay = self._friend_code_relay
+        client = self._client
+        if relay is None or client is None:
+            return
+        channel = await self._friend_code_owner_channel(binding)
+        message = None
+        if binding.message_id:
+            try:
+                message = await channel.fetch_message(int(binding.message_id))
+            except Exception:
+                logger.warning(
+                    "[%s] Owner approval message %s disappeared; recreating event %s",
+                    self.name,
+                    binding.message_id,
+                    binding.event_id,
+                )
+                binding.message_id = ""
+        if message is None:
+            message = await self._find_friend_code_message(channel, binding.marker)
+        if message is None:
+            kwargs = {"content": self._friend_code_owner_content(binding)}
+            allowed_mentions = self._friend_code_allowed_mentions()
+            if allowed_mentions is not None:
+                kwargs["allowed_mentions"] = allowed_mentions
+            message = await channel.send(**kwargs)
+        message_id = str(getattr(message, "id", "") or "")
+        if not message_id.isdigit():
+            raise RuntimeError("Discord did not return an owner message id")
+        if binding.message_id != message_id:
+            binding.message_id = message_id
+            self._save_friend_code_bindings()
+
+        view = FriendCodeApprovalView(
+            adapter=self,
+            event_id=binding.event_id,
+            approve_custom_id=binding.button_custom_id(
+                "approve", relay.owner_token
+            ),
+            deny_custom_id=binding.button_custom_id("deny", relay.owner_token),
+            disabled=binding.is_terminal,
+        )
+        view._message = message
+        await message.edit(
+            content=self._friend_code_owner_content(binding),
+            view=view,
+            allowed_mentions=self._friend_code_allowed_mentions(),
+        )
+        if not binding.is_terminal and hasattr(client, "add_view"):
+            client.add_view(view, message_id=int(message_id))
+
+    async def _ensure_friend_code_status_delivery(self, binding: Any) -> None:
+        from plugins.platforms.discord.friend_code_approval import friend_status_content
+
+        if not binding.is_terminal or binding.state in binding.friend_notified_states:
+            return
+        if self._client is None:
+            raise RuntimeError("Discord is not connected")
+        channel = self._client.get_channel(int(binding.friend_thread_id))
+        if channel is None:
+            channel = await self._client.fetch_channel(int(binding.friend_thread_id))
+        guild_id = str(getattr(getattr(channel, "guild", None), "id", "") or "")
+        parent_id = str(getattr(channel, "parent_id", "") or "")
+        if guild_id != binding.friend_guild_id or parent_id != binding.friend_channel_id:
+            raise RuntimeError("Discord friend status crossed its configured thread")
+        content = friend_status_content(binding, binding.state)
+        history = getattr(channel, "history", None)
+        if history is not None:
+            try:
+                async for message in history(limit=100):
+                    if str(getattr(message, "content", "") or "") == content:
+                        binding.friend_notified_states.append(binding.state)
+                        self._save_friend_code_bindings()
+                        return
+            except Exception:
+                logger.debug(
+                    "[%s] Could not search friend thread before status delivery",
+                    self.name,
+                    exc_info=True,
+                )
+        kwargs = {"content": content}
+        allowed_mentions = self._friend_code_allowed_mentions()
+        if allowed_mentions is not None:
+            kwargs["allowed_mentions"] = allowed_mentions
+        await channel.send(**kwargs)
+        binding.friend_notified_states.append(binding.state)
+        self._save_friend_code_bindings()
+
+    async def _handle_friend_code_decision(
+        self,
+        interaction: Any,
+        *,
+        event_id: str,
+        decision: str,
+        custom_id: str,
+    ) -> None:
+        """Authenticate one button click and send an exact broker decision."""
+        relay = self._friend_code_relay
+        binding = self._friend_code_bindings.get(str(event_id))
+        user_id = str(getattr(getattr(interaction, "user", None), "id", "") or "")
+        guild_id = str(getattr(getattr(interaction, "guild", None), "id", "") or "")
+        channel_id = str(
+            getattr(interaction, "channel_id", "")
+            or getattr(getattr(interaction, "channel", None), "id", "")
+            or ""
+        )
+        message_id = str(
+            getattr(getattr(interaction, "message", None), "id", "") or ""
+        )
+        authorized = bool(
+            relay is not None
+            and binding is not None
+            and user_id == binding.owner_user_id
+            and guild_id == binding.owner_guild_id
+            and channel_id == binding.owner_channel_id
+            and message_id == binding.message_id
+            and binding.verify_custom_id(custom_id, decision, relay.owner_token)
+        )
+        if not authorized:
+            await interaction.response.send_message(
+                "This approval control is not valid for you or this message.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        async with self._friend_code_relay_lock:
+            binding = self._friend_code_bindings.get(str(event_id))
+            if binding is None:
+                await interaction.followup.send(
+                    "This approval is no longer pending.", ephemeral=True
+                )
+                return
+            if binding.is_terminal:
+                await interaction.followup.send(
+                    f"This request is already {binding.state.replace('_', ' ')}.",
+                    ephemeral=True,
+                )
+                return
+            try:
+                receipt = await relay.decide(
+                    binding,
+                    decision,
+                    clicker_guild_id=guild_id,
+                    clicker_channel_id=channel_id,
+                    clicker_user_id=user_id,
+                )
+            except Exception as decision_error:
+                # A timeout may happen after the broker committed. Recover only
+                # through the exact idempotency-key receipt endpoint.
+                try:
+                    receipt = await relay.decision_receipt(binding, decision)
+                except Exception:
+                    logger.warning(
+                        "[%s] Friend code decision failed for event %s (%s)",
+                        self.name,
+                        event_id,
+                        type(decision_error).__name__,
+                    )
+                    await interaction.followup.send(
+                        "The broker did not confirm this decision. The request remains pending; try again.",
+                        ephemeral=True,
+                    )
+                    return
+            from plugins.platforms.discord.friend_code_approval import (
+                validate_decision_receipt,
+            )
+
+            try:
+                state = validate_decision_receipt(receipt, binding, decision)
+            except Exception:
+                logger.error(
+                    "[%s] Friend code broker returned a mismatched decision receipt for event %s",
+                    self.name,
+                    event_id,
+                )
+                await interaction.followup.send(
+                    "The broker returned a mismatched receipt. No local approval was recorded.",
+                    ephemeral=True,
+                )
+                return
+            binding.state = state
+            binding.decision = decision
+            binding.updated_at = dt.datetime.now(dt.timezone.utc).isoformat().replace(
+                "+00:00", "Z"
+            )
+            self._save_friend_code_bindings()
+            try:
+                await self._ensure_friend_code_owner_card(binding)
+                await self._ensure_friend_code_status_delivery(binding)
+            except Exception:
+                # The durable terminal state lets the poller repair Discord
+                # after a transient edit/send failure.
+                logger.warning(
+                    "[%s] Friend code decision committed but Discord repair is pending for event %s",
+                    self.name,
+                    event_id,
+                    exc_info=True,
+                )
+            await interaction.followup.send(
+                "Approved. Work is still blocked until the public-only runner is enabled."
+                if decision == "approve"
+                else "Denied.",
+                ephemeral=True,
+            )
+
     def _self_contained_prompt_content(
         self, header: str, body: str, *, code_block: bool = False, tail: str = ""
     ) -> str:
@@ -8839,7 +9377,64 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
+    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView
+    global ClarifyChoiceView, ChoicePickerView, FriendCodeApprovalView
+
+    class FriendCodeApprovalView(discord.ui.View):
+        """Persistent owner-only controls for one exact broker request."""
+
+        def __init__(
+            self,
+            *,
+            adapter: "DiscordAdapter",
+            event_id: str,
+            approve_custom_id: str,
+            deny_custom_id: str,
+            disabled: bool = False,
+        ):
+            super().__init__(timeout=None)
+            self.adapter = adapter
+            self.event_id = str(event_id)
+
+            approve = discord.ui.Button(
+                label="Approve",
+                style=discord.ButtonStyle.success,
+                custom_id=approve_custom_id,
+                disabled=disabled,
+            )
+            deny = discord.ui.Button(
+                label="Deny",
+                style=discord.ButtonStyle.danger,
+                custom_id=deny_custom_id,
+                disabled=disabled,
+            )
+            approve.callback = self._approve
+            deny.callback = self._deny
+            self.add_item(approve)
+            self.add_item(deny)
+
+        @staticmethod
+        def _interaction_custom_id(interaction: Any) -> str:
+            data = getattr(interaction, "data", None)
+            if not isinstance(data, dict):
+                return ""
+            return str(data.get("custom_id") or "")
+
+        async def _approve(self, interaction: Any) -> None:
+            await self.adapter._handle_friend_code_decision(
+                interaction,
+                event_id=self.event_id,
+                decision="approve",
+                custom_id=self._interaction_custom_id(interaction),
+            )
+
+        async def _deny(self, interaction: Any) -> None:
+            await self.adapter._handle_friend_code_decision(
+                interaction,
+                event_id=self.event_id,
+                decision="deny",
+                custom_id=self._interaction_custom_id(interaction),
+            )
 
     class ExecApprovalView(discord.ui.View):
         """

@@ -32,7 +32,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           short_sha="${GITHUB_SHA:0:10}"
-          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/hermes-agent"
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/hermes-agent-fleet"
           tag="v2026.8.22-friends.${short_sha}"
           printf 'image=%s\n' "$image" >>"$GITHUB_OUTPUT"
           printf 'tag=%s\n' "$tag" >>"$GITHUB_OUTPUT"
