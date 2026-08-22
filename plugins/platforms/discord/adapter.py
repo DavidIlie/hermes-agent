@@ -5115,7 +5115,9 @@ class DiscordAdapter(BasePlatformAdapter):
     # resolved channel ids into ``_is_allowed_user`` after the channel gate.
 
     def _evaluate_slash_authorization(
-        self, interaction: "discord.Interaction",
+        self,
+        interaction: "discord.Interaction",
+        command_text: str = "",
     ) -> Tuple[bool, Optional[str]]:
         """Evaluate slash authorization without producing any response.
 
@@ -5217,6 +5219,45 @@ class DiscordAdapter(BasePlatformAdapter):
                 "user not in DISCORD_ALLOWED_USERS / DISCORD_ALLOWED_ROLES",
             )
 
+        # Direct Discord handlers such as /thread perform work before the
+        # event reaches GatewayRunner._handle_message. /skill autocomplete
+        # reads the process-wide catalog before dispatch. Apply the same
+        # source/profile-aware slash policy here so neither path can bypass a
+        # multiplex profile's command boundary.
+        if command_text:
+            raw_command = str(command_text).strip().lstrip("/").split(maxsplit=1)[0]
+            if raw_command:
+                try:
+                    from hermes_cli.commands import resolve_command
+
+                    resolved = resolve_command(raw_command)
+                    canonical = resolved.name if resolved else raw_command.lower()
+                    source = self._build_slash_event(
+                        interaction, f"/{canonical}"
+                    ).source
+                    runner = getattr(self, "gateway_runner", None)
+                    if runner is not None and hasattr(runner, "_check_slash_access"):
+                        denial = runner._check_slash_access(source, canonical)
+                    else:
+                        from gateway.slash_access import policy_from_extra
+
+                        extra = getattr(self.config, "extra", None) or {}
+                        policy = policy_from_extra(extra, "dm" if in_dm else "group")
+                        denial = None
+                        if policy.enabled and not policy.can_run(user_id, canonical):
+                            denial = f"/{canonical} is not allowed for this user"
+                    if denial:
+                        return (False, f"profile slash policy denied: {denial}")
+                except Exception as exc:
+                    logger.warning(
+                        "[Discord] Could not evaluate source-aware slash policy "
+                        "for %r: %s",
+                        command_text,
+                        exc,
+                        exc_info=True,
+                    )
+                    return (False, "source-aware slash policy unavailable")
+
         return (True, None)
 
     async def _check_slash_authorization(
@@ -5229,7 +5270,9 @@ class DiscordAdapter(BasePlatformAdapter):
         alert — the caller must stop on False (the interaction has already
         been responded to).
         """
-        allowed, reason = self._evaluate_slash_authorization(interaction)
+        allowed, reason = self._evaluate_slash_authorization(
+            interaction, command_text
+        )
         if allowed:
             return True
         return await self._reject_slash(
@@ -6215,7 +6258,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 since process start shows up on the very next keystroke.
                 """
                 try:
-                    allowed, _reason = self._evaluate_slash_authorization(interaction)
+                    allowed, _reason = self._evaluate_slash_authorization(
+                        interaction, "/skill"
+                    )
                 except Exception:
                     # Defensive: never raise from autocomplete. Fail
                     # closed by returning an empty suggestion list.
@@ -6373,9 +6418,19 @@ class DiscordAdapter(BasePlatformAdapter):
             chat_name=chat_name,
             chat_type=chat_type,
             user_id=str(interaction.user.id),
-            user_name=interaction.user.display_name,
+            user_name=(
+                getattr(interaction.user, "display_name", None)
+                or getattr(interaction.user, "name", None)
+            ),
             thread_id=thread_id,
             chat_topic=chat_topic,
+            guild_id=(
+                str(getattr(interaction, "guild_id", "") or "") or None
+            ),
+            parent_chat_id=(
+                str(getattr(interaction.channel, "parent_id", "") or "")
+                or None
+            ),
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
@@ -6461,19 +6516,26 @@ class DiscordAdapter(BasePlatformAdapter):
         # Inherit forum topic when the thread was created inside a forum channel.
         _chan = getattr(interaction, "channel", None)
         chat_topic = self._get_effective_topic(_chan, is_thread=True) if _chan else None
+        _parent_channel = self._thread_parent_channel(_chan)
+        _parent_id = str(getattr(_parent_channel, "id", "") or "")
 
         source = self.build_source(
             chat_id=thread_id,
             chat_name=chat_name,
             chat_type="thread",
             user_id=str(interaction.user.id),
-            user_name=interaction.user.display_name,
+            user_name=(
+                getattr(interaction.user, "display_name", None)
+                or getattr(interaction.user, "name", None)
+            ),
             thread_id=thread_id,
             chat_topic=chat_topic,
+            guild_id=(
+                str(getattr(interaction, "guild_id", "") or "") or None
+            ),
+            parent_chat_id=_parent_id or None,
         )
 
-        _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
-        _parent_id = str(getattr(_parent_channel, "id", "") or "")
         _skills = self._resolve_channel_skills(thread_id, _parent_id or None)
         _channel_prompt = self._resolve_channel_prompt(thread_id, _parent_id or None)
         event = MessageEvent(
@@ -7562,6 +7624,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 confirm_id=confirm_id,
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
+                requester_user_id=_component_requester_user_id(metadata),
             )
 
             msg = await channel.send(content=content, embed=embed, view=view)
@@ -7669,6 +7732,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     clarify_id=clarify_id,
                     allowed_user_ids=self._allowed_user_ids,
                     allowed_role_ids=self._allowed_role_ids,
+                    requester_user_id=_component_requester_user_id(metadata),
                 )
             else:
                 embed.add_field(
@@ -7725,6 +7789,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 session_key=session_key,
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
+                requester_user_id=_component_requester_user_id(metadata),
             )
             # Mirror the prompt in plain content — embeds are invisible on
             # some clients (see send_exec_approval).
@@ -7791,6 +7856,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 on_model_selected=on_model_selected,
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
+                requester_user_id=_component_requester_user_id(metadata),
             )
 
             msg = await channel.send(embed=embed, view=view)
@@ -7839,6 +7905,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 on_choice_selected=on_choice_selected,
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
+                requester_user_id=_component_requester_user_id(metadata),
             )
 
             msg = await channel.send(embed=embed, view=view)
@@ -8622,6 +8689,7 @@ def _component_check_auth(
     interaction,
     allowed_user_ids: Optional[set],
     allowed_role_ids: Optional[set],
+    requester_user_id: Optional[str] = None,
 ) -> bool:
     """Shared user-or-role OR semantics for component view button clicks.
 
@@ -8644,6 +8712,20 @@ def _component_check_auth(
     user = getattr(interaction, "user", None)
     if user is None or getattr(user, "id", None) is None:
         return False
+
+    # Stateful controls in shared channels belong to the authenticated user
+    # who caused Hermes to render them. ``None`` preserves compatibility for
+    # views created directly by older integrations; an empty string is the
+    # fail-closed marker used by production send paths when origin metadata is
+    # unexpectedly missing.
+    if requester_user_id is not None:
+        expected_user_id = str(requester_user_id).strip()
+        try:
+            actual_user_id = str(user.id).strip()
+        except Exception:
+            return False
+        if not expected_user_id or actual_user_id != expected_user_id:
+            return False
 
     # Scope-aware reads (issue #72348): component interactions are dispatched
     # from discord.py tasks descended from the task created inside the owning
@@ -8704,6 +8786,11 @@ def _component_check_auth(
             pass
 
     return False
+
+
+def _component_requester_user_id(metadata: Optional[dict]) -> str:
+    """Return the authenticated prompt owner, or an explicit deny marker."""
+    return str((metadata or {}).get("requester_user_id") or "").strip()
 
 
 def _resolve_exec_approval_admin_gate(
@@ -8962,17 +9049,22 @@ def _define_discord_view_classes() -> None:
             confirm_id: str,
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
+            requester_user_id: Optional[str] = None,
         ):
             super().__init__(timeout=_read_discord_prompt_timeout())
             self.session_key = session_key
             self.confirm_id = confirm_id
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
+            self.requester_user_id = requester_user_id
             self.resolved = False
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             return _component_check_auth(
-                interaction, self.allowed_user_ids, self.allowed_role_ids,
+                interaction,
+                self.allowed_user_ids,
+                self.allowed_role_ids,
+                self.requester_user_id,
             )
 
         async def _resolve(
@@ -9007,7 +9099,10 @@ def _define_discord_view_classes() -> None:
             try:
                 from tools import slash_confirm as _slash_confirm_mod
                 result_text = await _slash_confirm_mod.resolve(
-                    self.session_key, self.confirm_id, choice,
+                    self.session_key,
+                    self.confirm_id,
+                    choice,
+                    requester_user_id=str(interaction.user.id),
                 )
                 if result_text:
                     await interaction.followup.send(result_text)
@@ -9067,16 +9162,21 @@ def _define_discord_view_classes() -> None:
             session_key: str,
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
+            requester_user_id: Optional[str] = None,
         ):
             super().__init__(timeout=_read_discord_prompt_timeout())
             self.session_key = session_key
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
+            self.requester_user_id = requester_user_id
             self.resolved = False
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             return _component_check_auth(
-                interaction, self.allowed_user_ids, self.allowed_role_ids,
+                interaction,
+                self.allowed_user_ids,
+                self.allowed_role_ids,
+                self.requester_user_id,
             )
 
         async def _respond(
@@ -9166,6 +9266,7 @@ def _define_discord_view_classes() -> None:
             on_model_selected,
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
+            requester_user_id: Optional[str] = None,
         ):
             super().__init__(timeout=120)
             self.providers = providers
@@ -9175,6 +9276,7 @@ def _define_discord_view_classes() -> None:
             self.on_model_selected = on_model_selected
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
+            self.requester_user_id = requester_user_id
             self.resolved = False
             self._selected_provider: str = ""
             self._pending_expensive_model: str = ""
@@ -9183,7 +9285,10 @@ def _define_discord_view_classes() -> None:
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             return _component_check_auth(
-                interaction, self.allowed_user_ids, self.allowed_role_ids,
+                interaction,
+                self.allowed_user_ids,
+                self.allowed_role_ids,
+                self.requester_user_id,
             )
 
         def _build_provider_select(self):
@@ -9451,6 +9556,11 @@ def _define_discord_view_classes() -> None:
             )
 
         async def _on_cancel(self, interaction: discord.Interaction):
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized~", ephemeral=True
+                )
+                return
             self.resolved = True
             self.clear_items()
             await interaction.response.edit_message(
@@ -9493,12 +9603,14 @@ def _define_discord_view_classes() -> None:
             on_choice_selected,
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
+            requester_user_id: Optional[str] = None,
         ):
             super().__init__(timeout=120)
             self.choices = list(choices)[:25]  # Discord select cap
             self.on_choice_selected = on_choice_selected
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
+            self.requester_user_id = requester_user_id
             self.resolved = False
             self._message = None
 
@@ -9523,7 +9635,10 @@ def _define_discord_view_classes() -> None:
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             return _component_check_auth(
-                interaction, self.allowed_user_ids, self.allowed_role_ids,
+                interaction,
+                self.allowed_user_ids,
+                self.allowed_role_ids,
+                self.requester_user_id,
             )
 
         async def _on_select(self, interaction: discord.Interaction):
@@ -9591,12 +9706,14 @@ def _define_discord_view_classes() -> None:
             clarify_id: str,
             allowed_user_ids: set,
             allowed_role_ids: Optional[set] = None,
+            requester_user_id: Optional[str] = None,
         ):
             super().__init__(timeout=_read_discord_prompt_timeout())
             self.choices = list(choices)[:24]
             self.clarify_id = clarify_id
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
+            self.requester_user_id = requester_user_id
             self.resolved = False
 
             for index, choice in enumerate(self.choices):
@@ -9660,7 +9777,10 @@ def _define_discord_view_classes() -> None:
 
         def _check_auth(self, interaction: "discord.Interaction") -> bool:
             return _component_check_auth(
-                interaction, self.allowed_user_ids, self.allowed_role_ids,
+                interaction,
+                self.allowed_user_ids,
+                self.allowed_role_ids,
+                self.requester_user_id,
             )
 
         def _make_choice_callback(self, index: int, choice: str):

@@ -19,6 +19,7 @@ Coverage targets:
 from __future__ import annotations
 
 from datetime import datetime
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -108,6 +109,49 @@ def _make_runner(*, platform_extra: dict | None = None,
     runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
     runner._emit_gateway_run_progress = AsyncMock()
     return runner
+
+
+def test_check_slash_access_loads_named_profile_policy(monkeypatch, tmp_path):
+    """A multiplex source must never inherit the owner's command policy."""
+    from gateway import run as gateway_run
+
+    runner = _make_runner(platform_extra={})
+    friends_config = GatewayConfig(
+        platforms={
+            Platform.DISCORD: PlatformConfig(
+                enabled=True,
+                token="***",
+                extra={
+                    "group_allow_admin_from": ["243009043260637184"],
+                    "group_user_allowed_commands": [],
+                },
+            )
+        }
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name", lambda: "default"
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir", lambda _name: tmp_path
+    )
+    profile_config_loader = MagicMock(return_value=friends_config)
+    monkeypatch.setattr(
+        "gateway.config.load_gateway_config", profile_config_loader
+    )
+    monkeypatch.setattr(
+        gateway_run, "_profile_runtime_scope", lambda _home: nullcontext()
+    )
+    source = _make_source(
+        user_id="1540773031436353708",
+        chat_type="thread",
+    )
+    source.profile = "friends"
+
+    denial = runner._check_slash_access(source, "skill")
+
+    assert denial is not None
+    assert "/skill is admin-only here" in denial
+    profile_config_loader.assert_called_once_with()
 
 
 # ---------------------------------------------------------------------------

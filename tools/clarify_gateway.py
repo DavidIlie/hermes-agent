@@ -51,6 +51,7 @@ class _ClarifyEntry:
     session_key: str
     question: str
     choices: Optional[List[str]]
+    requester_user_id: Optional[str] = None
     multi_select: bool = False
     event: threading.Event = field(default_factory=threading.Event)
     response: Optional[str] = None
@@ -62,6 +63,7 @@ class _ClarifyEntry:
             "session_key": self.session_key,
             "question": self.question,
             "choices": list(self.choices) if self.choices else None,
+            "requester_user_id": self.requester_user_id,
             "multi_select": bool(self.multi_select),
         }
 
@@ -83,6 +85,7 @@ def register(
     question: str,
     choices: Optional[List[str]],
     multi_select: bool = False,
+    requester_user_id: Optional[str] = None,
 ) -> _ClarifyEntry:
     """Register a pending clarify request and return the entry.
 
@@ -94,6 +97,9 @@ def register(
         session_key=session_key,
         question=question,
         choices=list(choices) if choices else None,
+        requester_user_id=(str(requester_user_id).strip() or None)
+        if requester_user_id is not None
+        else None,
         multi_select=bool(multi_select) and bool(choices),
         # Open-ended (no choices) → next message IS the response, no buttons needed.
         awaiting_text=not bool(choices),
@@ -180,6 +186,7 @@ def get_pending_for_session(
     session_key: str,
     *,
     include_choice_prompts: bool = False,
+    requester_user_id: Optional[str] = None,
 ) -> Optional[_ClarifyEntry]:
     """Return the oldest pending clarify entry for a session, or None.
 
@@ -196,6 +203,10 @@ def get_pending_for_session(
             entry = _entries.get(cid)
             if entry is None:
                 continue
+            if entry.requester_user_id is not None:
+                requester = str(requester_user_id or "").strip()
+                if not requester or requester != entry.requester_user_id:
+                    continue
             if include_choice_prompts or entry.awaiting_text:
                 return entry
         return None
@@ -326,13 +337,21 @@ def _coerce_multi_select_text(entry: _ClarifyEntry, text: str) -> Optional[str]:
     return _json.dumps(selected, ensure_ascii=False)
 
 
-def resolve_text_response_for_session(session_key: str, response: str) -> bool:
+def resolve_text_response_for_session(
+    session_key: str,
+    response: str,
+    requester_user_id: Optional[str] = None,
+) -> bool:
     """Resolve the oldest pending clarify in ``session_key`` from typed text.
 
     Returns False if no pending clarify exists or if the response was rejected
     (arbitrary prose for native interactive multi-choice clarifies).
     """
-    entry = get_pending_for_session(session_key, include_choice_prompts=True)
+    entry = get_pending_for_session(
+        session_key,
+        include_choice_prompts=True,
+        requester_user_id=requester_user_id,
+    )
     if entry is None:
         return False
 

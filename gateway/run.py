@@ -5521,6 +5521,7 @@ class TurnRunner:
                 question=question,
                 choices=list(choices) if choices else None,
                 multi_select=bool(multi_select),
+                requester_user_id=ctx.source.user_id,
             )
 
             # Pause typing — like approval, we don't want a "thinking..."
@@ -14321,6 +14322,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
+        # Transport callbacks can run before the profile-stamping message
+        # handler. Bind adapter ownership eagerly so source construction for
+        # slash commands and component/autocomplete callbacks stays scoped.
+        adapter._multiplex_profile_name = profile_name
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
@@ -15660,10 +15665,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _quick_key = self._session_key_for_source(source)
         allow_gateway_control = event.allow_gateway_control
         _up_state = self._peek_session_state(_quick_key)
+        _update_requester_matches = True
+        if (
+            source.platform == Platform.DISCORD
+            and _up_state is not None
+            and _up_state.persistent.update_prompt_pending
+        ):
+            # Discord threads can be shared by several admitted friends. The
+            # update prompt belongs to the authenticated user recorded when
+            # /update created its durable marker; a different member's text
+            # must remain an ordinary message and must never reach the global
+            # .update_response IPC file.
+            _update_requester_matches = False
+            for _update_marker in (
+                _hermes_home / ".update_pending.claimed.json",
+                _hermes_home / ".update_pending.json",
+            ):
+                try:
+                    _update_origin = json.loads(
+                        _update_marker.read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError, TypeError):
+                    continue
+                _origin_session = str(_update_origin.get("session_key") or "")
+                _origin_user = str(_update_origin.get("user_id") or "")
+                if _origin_session and _origin_session != _quick_key:
+                    continue
+                _update_requester_matches = bool(
+                    _origin_user and _origin_user == str(source.user_id or "")
+                )
+                break
         if (
             allow_gateway_control
             and _up_state is not None
             and _up_state.persistent.update_prompt_pending
+            and _update_requester_matches
         ):
             raw = (event.text or "").strip()
             # Accept /approve and /deny as shorthand for yes/no
@@ -15739,7 +15775,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from tools import clarify_gateway as _clarify_mod
             _pending_clarify = _clarify_mod.get_pending_for_session(
-                _quick_key, include_choice_prompts=True,
+                _quick_key,
+                include_choice_prompts=True,
+                requester_user_id=source.user_id,
             )
         except Exception:
             _pending_clarify = None
@@ -15764,7 +15802,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # with an empty response.
             if _raw_clarify_reply and not _raw_clarify_reply.startswith("/"):
                 _resolved = _clarify_mod.resolve_text_response_for_session(
-                    _quick_key, _raw_clarify_reply,
+                    _quick_key,
+                    _raw_clarify_reply,
+                    requester_user_id=source.user_id,
                 )
                 if _resolved:
                     logger.info(
@@ -15803,6 +15843,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Slash-confirm only catches /approve when no tool approval is live.
         from tools import slash_confirm as _slash_confirm_mod
         _pending_confirm = _slash_confirm_mod.get_pending(_quick_key)
+        if (
+            _pending_confirm
+            and _pending_confirm.get("requester_user_id") is not None
+            and str(_pending_confirm.get("requester_user_id") or "")
+            != str(source.user_id or "")
+        ):
+            _pending_confirm = None
         _tool_approval_live = False
         try:
             from tools.approval import has_blocking_approval
@@ -15833,7 +15880,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _confirm_choice = "cancel"
             if _confirm_choice is not None:
                 _resolved = await _slash_confirm_mod.resolve(
-                    _quick_key, _pending_confirm.get("confirm_id"), _confirm_choice,
+                    _quick_key,
+                    _pending_confirm.get("confirm_id"),
+                    _confirm_choice,
+                    requester_user_id=source.user_id,
                 )
                 return _resolved or ""
             # Stale pending + unrelated command: drop the pending state so
@@ -19966,7 +20016,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if not canonical_cmd:
             return None
-        policy = _policy_for_source(self.config, source)
+        policy_config = self.config
+        profile_name = str(getattr(source, "profile", "") or "").strip()
+        if profile_name:
+            try:
+                from gateway.config import load_gateway_config
+                from hermes_cli.profiles import (
+                    get_active_profile_name,
+                    get_profile_dir,
+                )
+
+                active_profile = get_active_profile_name() or "default"
+                if profile_name != active_profile:
+                    profile_home = get_profile_dir(profile_name)
+                    with _profile_runtime_scope(profile_home):
+                        policy_config = load_gateway_config()
+            except Exception as exc:
+                logger.error(
+                    "Slash command /%s denied: could not load policy for "
+                    "multiplex profile %r: %s",
+                    canonical_cmd,
+                    profile_name,
+                    exc,
+                    exc_info=True,
+                )
+                return (
+                    f"⛔ /{canonical_cmd} is unavailable because the "
+                    f"'{profile_name}' profile policy could not be verified."
+                )
+        policy = _policy_for_source(policy_config, source)
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
         logger.info(
@@ -22282,7 +22360,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Register the pending confirm FIRST so a super-fast button click
         # cannot race the send_slash_confirm return.
-        _slash_confirm_mod.register(session_key, confirm_id, command, handler)
+        _slash_confirm_mod.register(
+            session_key,
+            confirm_id,
+            command,
+            handler,
+            requester_user_id=(
+                source.user_id if source.platform == Platform.DISCORD else None
+            ),
+        )
 
         adapter = self._adapter_for_source(source)
         metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
@@ -22343,6 +22429,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if team_id:
                 metadata = dict(metadata or {})
                 metadata["slack_team_id"] = str(team_id)
+        if (
+            getattr(source, "platform", None) == Platform.DISCORD
+            and getattr(source, "user_id", None)
+        ):
+            metadata = dict(metadata or {})
+            metadata["requester_user_id"] = str(source.user_id)
         return metadata
 
     def _thread_metadata_for_target(
@@ -22504,6 +22596,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             reply_to_message_id=message_id,
                             adapter=adapter,
                         )
+                        if platform == Platform.DISCORD and pending.get("user_id"):
+                            metadata = dict(metadata or {})
+                            metadata["requester_user_id"] = str(pending["user_id"])
                         # Fallback session key if not stored (old pending files)
                         if not session_key:
                             session_key = f"{platform_str}:{chat_id}"
@@ -26765,6 +26860,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _status_thread_metadata = {
                     "reply_to_message_id": event_message_id
                 }
+        if source.platform == Platform.DISCORD and source.user_id:
+            _status_thread_metadata = dict(_status_thread_metadata or {})
+            _status_thread_metadata["requester_user_id"] = str(source.user_id)
 
         # Bridge extracted to TurnRunner._status_callback_sync; publish the
         # status wiring computed above onto the shared TurnContext at the

@@ -217,6 +217,85 @@ async def test_allowed_user_passes(adapter):
     interaction.response.send_message.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_direct_thread_handler_honors_profile_slash_policy(adapter):
+    """Direct /thread work must be denied before it creates a thread."""
+    adapter._allowed_user_ids = {"100200300"}
+    runner = SimpleNamespace(
+        _profile_name_for_source=MagicMock(return_value="friends"),
+        _check_slash_access=MagicMock(
+            return_value="⛔ /thread is admin-only here."
+        ),
+        adapters={},
+        config=SimpleNamespace(get_home_channel=lambda _platform: None),
+    )
+    adapter.gateway_runner = runner
+    interaction = _make_interaction(
+        "100200300",
+        channel_id=9999,
+        guild_id=42,
+        in_thread=True,
+        parent_channel_id=5555,
+    )
+
+    adapter._create_thread = AsyncMock()
+    await adapter._handle_thread_create_slash(
+        interaction,
+        name="new-work",
+        message="do it",
+    )
+
+    checked_source, checked_command = runner._check_slash_access.call_args.args
+    assert checked_command == "thread"
+    assert checked_source.profile == "friends"
+    assert checked_source.scope_id == "42"
+    assert checked_source.parent_chat_id == "5555"
+    adapter._create_thread.assert_not_awaited()
+    interaction.response.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_direct_thread_handler_keeps_owner_behavior(adapter):
+    adapter._allowed_user_ids = {"243009043260637184"}
+    adapter.gateway_runner = SimpleNamespace(
+        _profile_name_for_source=MagicMock(return_value=None),
+        _check_slash_access=MagicMock(return_value=None),
+    )
+    adapter._create_thread = AsyncMock(
+        return_value={"success": True, "thread_id": "7777", "thread_name": "work"}
+    )
+    interaction = _make_interaction("243009043260637184")
+    interaction.followup = SimpleNamespace(send=AsyncMock())
+
+    await adapter._handle_thread_create_slash(interaction, name="work")
+
+    adapter._create_thread.assert_awaited_once()
+    adapter.gateway_runner._check_slash_access.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_typed_skill_bundle_command_honors_profile_policy(adapter):
+    """Individual owner-primed skill commands share the same profile gate."""
+    adapter._allowed_user_ids = {"100200300"}
+    adapter.gateway_runner = SimpleNamespace(
+        _profile_name_for_source=MagicMock(return_value="friends"),
+        _check_slash_access=MagicMock(
+            return_value="⛔ /private-owner-protocol is admin-only here."
+        ),
+        adapters={},
+        config=SimpleNamespace(get_home_channel=lambda _platform: None),
+    )
+    interaction = _make_interaction("100200300")
+
+    assert await adapter._check_slash_authorization(
+        interaction, "/private-owner-protocol"
+    ) is False
+
+    source, command = adapter.gateway_runner._check_slash_access.call_args.args
+    assert source.profile == "friends"
+    assert command == "private-owner-protocol"
+
+
 def test_pairing_approved_user_passes_message_gate_without_allowlist(adapter, monkeypatch):
     """Pairing grants must be honored before on_message drops guild mentions."""
     _stub_pairing_store(monkeypatch, {"100200300"})
@@ -487,6 +566,80 @@ async def test_skill_autocomplete_returns_empty_for_unauthorized(
 
 
 @pytest.mark.asyncio
+async def test_skill_autocomplete_honors_profile_slash_policy(
+    adapter, monkeypatch,
+):
+    """An admitted friend cannot enumerate an owner-primed skill catalog."""
+    adapter._allowed_user_ids = {"100200300"}
+    adapter.gateway_runner = SimpleNamespace(
+        _profile_name_for_source=MagicMock(return_value="friends"),
+        _check_slash_access=MagicMock(
+            return_value="⛔ /skill is admin-only here."
+        ),
+    )
+    entries = [
+        ("private-owner-protocol", "Private workflow", "/private-owner-protocol"),
+    ]
+    _handler, autocomplete = _capture_skill_registration(
+        adapter, monkeypatch, entries,
+    )
+
+    interaction = _make_interaction("100200300")
+    assert await autocomplete(interaction, "") == []
+    adapter.gateway_runner._check_slash_access.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_skill_handler_denies_friend_before_owner_catalog_lookup(
+    adapter, monkeypatch,
+):
+    adapter._allowed_user_ids = {"100200300"}
+    adapter.gateway_runner = SimpleNamespace(
+        _profile_name_for_source=MagicMock(return_value="friends"),
+        _check_slash_access=MagicMock(
+            return_value="⛔ /skill is admin-only here."
+        ),
+        adapters={},
+        config=SimpleNamespace(get_home_channel=lambda _platform: None),
+    )
+    handler, _autocomplete = _capture_skill_registration(
+        adapter,
+        monkeypatch,
+        [("private-owner-protocol", "Private workflow", "/private-owner-protocol")],
+    )
+    adapter._run_simple_slash = AsyncMock()  # type: ignore[assignment]
+    interaction = _make_interaction("100200300")
+
+    await handler(interaction, "private-owner-protocol", "")
+
+    adapter._run_simple_slash.assert_not_awaited()
+    interaction.response.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_skill_handler_keeps_owner_behavior(adapter, monkeypatch):
+    owner = "243009043260637184"
+    adapter._allowed_user_ids = {owner}
+    adapter.gateway_runner = SimpleNamespace(
+        _profile_name_for_source=MagicMock(return_value=None),
+        _check_slash_access=MagicMock(return_value=None),
+    )
+    handler, _autocomplete = _capture_skill_registration(
+        adapter,
+        monkeypatch,
+        [("public-skill", "Safe workflow", "/public-skill")],
+    )
+    adapter._run_simple_slash = AsyncMock()  # type: ignore[assignment]
+    interaction = _make_interaction(owner)
+
+    await handler(interaction, "public-skill", "argument")
+
+    adapter._run_simple_slash.assert_awaited_once_with(
+        interaction, "/public-skill argument"
+    )
+
+
+@pytest.mark.asyncio
 async def test_skill_handler_rejects_before_dispatch_for_unauthorized(
     adapter, monkeypatch,
 ):
@@ -548,5 +701,3 @@ async def test_skill_handler_known_and_unknown_produce_same_rejection(
     )
     assert known_args == unknown_args
     assert known_kwargs == unknown_kwargs
-
-
