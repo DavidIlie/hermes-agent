@@ -223,11 +223,32 @@ def _ensure_discord_mock() -> None:
     # tests that subclass ModelPickerView / iterate .children / clear
     # items work.
     class _FakeView:
+        def __init_subclass__(cls, **kwargs):
+            super().__init_subclass__(**kwargs)
+            cls.__view_children_items__ = [
+                value
+                for base in reversed(cls.__mro__)
+                for value in base.__dict__.values()
+                if hasattr(value, "__discord_ui_model_type__")
+            ]
+
         def __init__(self, timeout=None):
             self.timeout = timeout
             self.children = []
+            for callback in getattr(type(self), "__view_children_items__", []):
+                item_type = callback.__discord_ui_model_type__
+                item = item_type(**callback.__discord_ui_model_kwargs__)
+
+                async def invoke(interaction, *, _callback=callback, _item=item):
+                    return await _callback(self, interaction, _item)
+
+                item.callback = invoke
+                self.children.append(item)
         def add_item(self, item):
             self.children.append(item)
+        def remove_item(self, item):
+            if item in self.children:
+                self.children.remove(item)
         def clear_items(self):
             self.children.clear()
 
@@ -259,6 +280,14 @@ def _ensure_discord_mock() -> None:
             self.description = description
     discord_mod.SelectOption = _FakeSelectOption
 
+    def _fake_button(*_args, **kwargs):
+        def decorate(callback):
+            callback.__discord_ui_model_type__ = _FakeButton
+            callback.__discord_ui_model_kwargs__ = kwargs
+            return callback
+
+        return decorate
+
     # AudioSource: real class so VoiceMixer(discord.AudioSource) can subclass
     # it cleanly in tests.  MagicMock auto-attributes would make is_opus()
     # return a Mock instead of False, breaking 9 TestVoiceMixerCore tests.
@@ -275,7 +304,7 @@ def _ensure_discord_mock() -> None:
         View=_FakeView,
         Select=_FakeSelect,
         Button=_FakeButton,
-        button=lambda *a, **k: (lambda fn: fn),
+        button=_fake_button,
     )
     discord_mod.ButtonStyle = SimpleNamespace(
         success=1, primary=2, secondary=2, danger=3,
@@ -551,4 +580,3 @@ def pytest_configure(config):
             raise pytest.UsageError(msg)
         else:
             cache_file.write_text("clean", encoding="utf-8")
-
