@@ -53,6 +53,7 @@ def register(
     confirm_id: str,
     command: str,
     handler: Callable[[str], Awaitable[Optional[str]]],
+    requester_user_id: Optional[str] = None,
 ) -> None:
     """Register a pending slash-command confirmation.
 
@@ -65,13 +66,29 @@ def register(
             "command": command,
             "handler": handler,
             "created_at": time.time(),
+            "requester_user_id": (
+                str(requester_user_id).strip() or None
+                if requester_user_id is not None
+                else None
+            ),
         }
 
 
-def get_pending(session_key: str) -> Optional[Dict[str, Any]]:
+def get_pending(
+    session_key: str,
+    requester_user_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """Return the pending confirm dict for a session, or None."""
     with _lock:
         entry = _pending.get(session_key)
+        if (
+            entry
+            and entry.get("requester_user_id") is not None
+            and requester_user_id is not None
+        ):
+            requester = str(requester_user_id or "").strip()
+            if not requester or requester != entry["requester_user_id"]:
+                return None
         return dict(entry) if entry else None
 
 
@@ -101,6 +118,7 @@ async def resolve(
     confirm_id: str,
     choice: str,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    requester_user_id: Optional[str] = None,
 ) -> Optional[str]:
     """Resolve a pending confirm.
 
@@ -119,6 +137,10 @@ async def resolve(
         if entry.get("confirm_id") != confirm_id:
             # Stale confirm_id — superseded by a newer prompt on the same session.
             return None
+        if entry.get("requester_user_id") is not None:
+            requester = str(requester_user_id or "").strip()
+            if not requester or requester != entry["requester_user_id"]:
+                return None
         # Pop before we run the handler to prevent duplicate callbacks
         # (e.g. button double-click) from running it twice.
         _pending.pop(session_key, None)

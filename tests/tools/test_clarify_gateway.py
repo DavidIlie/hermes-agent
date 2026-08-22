@@ -162,6 +162,29 @@ class TestGatewayTextIntercept:
         pending2 = cm.get_pending_for_session("sk")
         assert pending2 is not None
         assert pending2.clarify_id == "first"
+
+    def test_text_response_is_bound_to_authenticated_requester(self):
+        from tools import clarify_gateway as cm
+
+        cm.register(
+            "owned",
+            "shared-thread",
+            "What should I do?",
+            None,
+            requester_user_id="owner",
+        )
+
+        assert cm.get_pending_for_session(
+            "shared-thread", requester_user_id="friend"
+        ) is None
+        assert cm.resolve_text_response_for_session(
+            "shared-thread", "attacker answer", requester_user_id="friend"
+        ) is False
+        assert cm.resolve_text_response_for_session(
+            "shared-thread", "owner answer", requester_user_id="owner"
+        ) is True
+        assert cm.wait_for_response("owned", timeout=0.1) == "owner answer"
+
     def test_text_fallback_enables_awaiting_text_for_multi_choice(self):
         """When base send_clarify renders choices as text, mark_awaiting_text
         is called so the gateway text-intercept can capture the reply."""

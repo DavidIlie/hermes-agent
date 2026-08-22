@@ -91,6 +91,40 @@ class TestResolve:
         assert calls == ["once"]
         assert (r1 == "ran") ^ (r2 == "ran")
 
+    @pytest.mark.asyncio
+    async def test_resolve_is_bound_to_authenticated_requester(self):
+        calls = []
+
+        async def handler(choice):
+            calls.append(choice)
+            return "ran"
+
+        slash_confirm.register(
+            "shared-thread",
+            "cid1",
+            "reload-mcp",
+            handler,
+            requester_user_id="owner",
+        )
+
+        assert slash_confirm.get_pending(
+            "shared-thread", requester_user_id="friend"
+        ) is None
+        assert await slash_confirm.resolve(
+            "shared-thread",
+            "cid1",
+            "once",
+            requester_user_id="friend",
+        ) is None
+        assert calls == []
+        assert await slash_confirm.resolve(
+            "shared-thread",
+            "cid1",
+            "once",
+            requester_user_id="owner",
+        ) == "ran"
+        assert calls == ["once"]
+
 
 class TestClear:
     def test_clear_removes_entry(self):

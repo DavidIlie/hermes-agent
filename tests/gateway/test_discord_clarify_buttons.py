@@ -220,6 +220,7 @@ class TestDiscordSendClarify:
             choices=["red", "green", "blue"],
             clarify_id="cidM",
             session_key="sk-M",
+            metadata={"requester_user_id": "42"},
         )
 
         assert result.success is True
@@ -230,6 +231,7 @@ class TestDiscordSendClarify:
         assert "embed" in kwargs
         assert "view" in kwargs
         assert isinstance(kwargs["view"], ClarifyChoiceView)
+        assert kwargs["view"].requester_user_id == "42"
         # 3 choice buttons + 1 Other
         assert len(kwargs["view"].children) == 4
 

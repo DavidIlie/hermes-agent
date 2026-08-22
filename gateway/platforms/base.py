@@ -104,6 +104,14 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     """
     thread_id = getattr(source, "thread_id", None)
     metadata = {"thread_id": thread_id} if thread_id is not None else {}
+    if (
+        _platform_name(getattr(source, "platform", None)) == "discord"
+        and getattr(source, "user_id", None)
+    ):
+        # Discord component prompts are visible to everyone in a shared
+        # channel. Carry the authenticated invoker so stateful controls can
+        # bind their callbacks to the user who caused Hermes to render them.
+        metadata["requester_user_id"] = str(source.user_id)
     # Slack workspace identity is durable routing state, not ephemeral event
     # metadata. Carry it on every outbound path (including unthreaded sends)
     # so a multi-workspace Socket Mode gateway never falls back to its primary
@@ -6085,6 +6093,7 @@ class BasePlatformAdapter(ABC):
                         _clarify_mod.get_pending_for_session(
                             session_key,
                             include_choice_prompts=True,
+                            requester_user_id=event.source.user_id,
                         ) is not None
                     )
                 except Exception:
@@ -7041,11 +7050,16 @@ class BasePlatformAdapter(ABC):
         if chat_topic is not None and not chat_topic.strip():
             chat_topic = None
 
-        # Resolve profile from configured routes (None when no match / no routes)
-        profile = None
+        # A secondary multiplex adapter owns one profile even before its
+        # message handler runs. Stamp that ownership here so direct platform
+        # callbacks (Discord slash commands/autocomplete) cannot momentarily
+        # fall back to the active profile's command or skill policy.
+        profile = str(
+            getattr(self, "_multiplex_profile_name", "") or ""
+        ).strip() or None
         profile_route_rejected = False
         runner = getattr(self, "gateway_runner", None)
-        if runner is not None:
+        if runner is not None and profile is None:
             from gateway.profile_routing import ProfileRouteRejected
 
             try:

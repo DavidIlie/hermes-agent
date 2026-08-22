@@ -13,13 +13,17 @@ handling, and fail-closed behavior so the parity cannot regress.
 """
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
+
+from gateway.platforms.base import _thread_metadata_for_source
 
 # Trigger the shared discord mock from tests/gateway/conftest.py before
 # importing the production module.
 from plugins.platforms.discord.adapter import (  # noqa: E402
     ClarifyChoiceView,
+    ChoicePickerView,
     ExecApprovalView,
     ModelPickerView,
     SlashConfirmView,
@@ -84,6 +88,124 @@ def test_component_check_explicit_allow_all_passes(monkeypatch, env_name, env_va
     monkeypatch.setenv(env_name, env_value)
     interaction = _interaction(11111)
     assert _component_check_auth(interaction, set(), set()) is True
+
+
+def test_component_requester_binding_overrides_allow_all(monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
+
+    assert _component_check_auth(
+        _interaction("owner"), set(), set(), "owner"
+    ) is True
+    assert _component_check_auth(
+        _interaction("friend"), set(), set(), "owner"
+    ) is False
+    assert _component_check_auth(
+        _interaction("owner"), set(), set(), ""
+    ) is False
+
+
+def test_discord_delivery_metadata_carries_authenticated_requester():
+    source = SimpleNamespace(
+        platform=SimpleNamespace(value="discord"),
+        thread_id="thread-1",
+        user_id="owner",
+        chat_type="group",
+    )
+
+    assert _thread_metadata_for_source(source) == {
+        "thread_id": "thread-1",
+        "requester_user_id": "owner",
+    }
+
+
+def _stateful_component_views(requester_user_id: str):
+    async def _noop(*_args, **_kwargs):
+        return "ok"
+
+    return [
+        SlashConfirmView(
+            session_key="s",
+            confirm_id="c",
+            allowed_user_ids=set(),
+            requester_user_id=requester_user_id,
+        ),
+        UpdatePromptView(
+            session_key="s",
+            allowed_user_ids=set(),
+            requester_user_id=requester_user_id,
+        ),
+        ModelPickerView(
+            providers=[],
+            current_model="m",
+            current_provider="p",
+            session_key="s",
+            on_model_selected=_noop,
+            allowed_user_ids=set(),
+            requester_user_id=requester_user_id,
+        ),
+        ChoicePickerView(
+            choices=[{"value": "low", "label": "Low"}],
+            on_choice_selected=_noop,
+            allowed_user_ids=set(),
+            requester_user_id=requester_user_id,
+        ),
+        ClarifyChoiceView(
+            choices=["one"],
+            clarify_id="c",
+            allowed_user_ids=set(),
+            requester_user_id=requester_user_id,
+        ),
+    ]
+
+
+def test_stateful_component_views_are_owned_by_invoker_under_allow_all(monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
+
+    for view in _stateful_component_views("owner"):
+        assert view._check_auth(_interaction("owner")) is True
+        assert view._check_auth(_interaction("friend")) is False
+
+
+def test_stateful_component_views_fail_closed_without_transport_owner(monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
+
+    for view in _stateful_component_views(""):
+        assert view._check_auth(_interaction("owner")) is False
+
+
+@pytest.mark.asyncio
+async def test_model_picker_cancel_is_bound_to_invoker(monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
+
+    async def _noop(*_args, **_kwargs):
+        return "ok"
+
+    view = ModelPickerView(
+        providers=[],
+        current_model="m",
+        current_provider="p",
+        session_key="s",
+        on_model_selected=_noop,
+        allowed_user_ids=set(),
+        requester_user_id="owner",
+    )
+    friend = _interaction("friend")
+    friend.response = SimpleNamespace(
+        send_message=AsyncMock(), edit_message=AsyncMock()
+    )
+    await view._on_cancel(friend)
+    assert view.resolved is False
+    friend.response.send_message.assert_awaited_once()
+    friend.response.edit_message.assert_not_awaited()
+
+    owner = _interaction("owner")
+    owner.response = SimpleNamespace(
+        send_message=AsyncMock(), edit_message=AsyncMock()
+    )
+    await view._on_cancel(owner)
+    assert view.resolved is True
+    owner.response.send_message.assert_not_awaited()
+    owner.response.edit_message.assert_awaited_once()
 
 
 # ── user allowlist ─────────────────────────────────────────────────────────
@@ -277,4 +399,3 @@ def test_other_views_not_admin_gated():
         session_key="s", confirm_id="c", allowed_user_ids={"11111"}
     )
     assert sc._check_auth(_interaction(11111)) is True
-
