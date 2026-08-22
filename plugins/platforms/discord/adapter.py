@@ -7573,7 +7573,9 @@ class DiscordAdapter(BasePlatformAdapter):
         self._friend_code_relay_task = task
 
     async def _cancel_friend_code_relay_task(self) -> None:
-        task = self._friend_code_relay_task
+        # A few legacy integrations construct a partial adapter without
+        # running __init__. Shutdown must remain safe for those objects.
+        task = getattr(self, "_friend_code_relay_task", None)
         self._friend_code_relay_task = None
         if task is None or task is asyncio.current_task():
             return
