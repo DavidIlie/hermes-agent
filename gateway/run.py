@@ -7106,18 +7106,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         (preserve the queue so messages sent during the outage are delivered
         rather than silently dropped — #46621).
         """
+        async def _connect():
+            if getattr(self.config, "multiplex_profiles", False):
+                profile_name = str(
+                    getattr(adapter, "_multiplex_profile_name", "") or ""
+                ).strip()
+                if profile_name:
+                    from hermes_cli.profiles import get_profile_dir
+
+                    profile_home = get_profile_dir(profile_name)
+                else:
+                    profile_home = Path(get_hermes_home())
+                with _profile_runtime_scope(profile_home):
+                    return await adapter.connect(is_reconnect=is_reconnect)
+            return await adapter.connect(is_reconnect=is_reconnect)
+
         timeout = self._platform_connect_timeout_secs(platform)
         if timeout <= 0:
-            return await adapter.connect(is_reconnect=is_reconnect)
+            return await _connect()
         # Use the detach-on-timeout pattern instead of plain asyncio.wait_for:
         # asyncio.wait_for cancels the overdue task but then waits for it to
         # exit. An adapter connect() that catches CancelledError can therefore
         # block recovery forever (the watcher never reaches the next retry).
         # Keep ownership of the old task through its done callback, but
         # release the runner at the deadline (#70344).
-        task = asyncio.ensure_future(
-            adapter.connect(is_reconnect=is_reconnect)
-        )
+        task = asyncio.ensure_future(_connect())
         try:
             done, _pending = await asyncio.wait({task}, timeout=timeout)
         except asyncio.CancelledError:

@@ -264,6 +264,44 @@ class TestPrimaryMessageRuntimeScope:
             secret_scope.get_secret("DISCORD_ALLOW_ALL_USERS")
 
 
+class TestPrimaryAdapterConnectRuntimeScope:
+    @pytest.mark.asyncio
+    async def test_connect_sees_default_profile_secrets(
+        self, tmp_path, monkeypatch
+    ):
+        from agent import secret_scope
+        from gateway import run as run_mod
+        from gateway.run import GatewayRunner
+
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".env").write_text(
+            "HERMES_FRIEND_CODE_OWNER_TOKEN=owner-relay-token\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(run_mod, "get_hermes_home", lambda: home)
+        monkeypatch.delenv("HERMES_FRIEND_CODE_OWNER_TOKEN", raising=False)
+        secret_scope.set_multiplex_active(True)
+
+        class Adapter:
+            async def connect(self, *, is_reconnect=False):
+                assert is_reconnect is False
+                return (
+                    secret_scope.get_secret("HERMES_FRIEND_CODE_OWNER_TOKEN")
+                    == "owner-relay-token"
+                )
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._platform_connect_timeout_secs = lambda _platform: 0
+
+        assert await runner._connect_adapter_with_timeout(
+            Adapter(), Platform.DISCORD
+        ) is True
+        with pytest.raises(secret_scope.UnscopedSecretError):
+            secret_scope.get_secret("HERMES_FRIEND_CODE_OWNER_TOKEN")
+
+
 class TestReconnectDropsEmptyToken:
     @pytest.mark.asyncio
     async def test_empty_token_removed_from_queue(self):
