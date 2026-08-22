@@ -200,6 +200,7 @@ class TestPrimaryMessageRuntimeScope:
 
         runner = GatewayRunner.__new__(GatewayRunner)
         runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._resolve_profile_home_for_source = lambda _source: home
 
         async def _handle_message(_event):
             from gateway.session import _discord_tools_loaded
@@ -212,6 +213,55 @@ class TestPrimaryMessageRuntimeScope:
         assert await handler(SimpleNamespace(source=SimpleNamespace(profile=None))) is True
         with pytest.raises(secret_scope.UnscopedSecretError):
             secret_scope.get_secret("DISCORD_BOT_TOKEN")
+
+    @pytest.mark.asyncio
+    async def test_primary_transport_authorizes_under_routed_profile_scope(
+        self, tmp_path, monkeypatch
+    ):
+        from agent import secret_scope
+        from gateway.config import Platform
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource
+
+        default_home = tmp_path / "default"
+        friends_home = tmp_path / "friends"
+        default_home.mkdir()
+        friends_home.mkdir()
+        (default_home / ".env").write_text(
+            "DISCORD_ALLOWED_USERS=owner-only\n", encoding="utf-8"
+        )
+        (friends_home / ".env").write_text(
+            "DISCORD_ALLOW_ALL_USERS=true\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+        monkeypatch.setenv("DISCORD_ALLOWED_USERS", "owner-only")
+        monkeypatch.delenv("DISCORD_ALLOW_ALL_USERS", raising=False)
+        secret_scope.set_multiplex_active(True)
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.adapters = {}
+        runner._profile_adapters = {}
+        runner.pairing_stores = {}
+        runner.pairing_store = None
+        runner._resolve_profile_home_for_source = lambda _source: friends_home
+
+        async def _handle_message(event):
+            return runner._is_user_authorized(event.source)
+
+        runner._handle_message = _handle_message  # type: ignore[method-assign]
+        handler = runner._primary_message_handler()
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="friends-channel",
+            chat_type="group",
+            user_id="friend-user",
+            profile="friends",
+        )
+
+        assert await handler(SimpleNamespace(source=source)) is True
+        with pytest.raises(secret_scope.UnscopedSecretError):
+            secret_scope.get_secret("DISCORD_ALLOW_ALL_USERS")
 
 
 class TestReconnectDropsEmptyToken:
