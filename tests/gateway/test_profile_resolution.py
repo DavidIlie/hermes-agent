@@ -308,6 +308,63 @@ class TestAdapterToSessionKeyIntegration:
         # A default-profile key would land in agent:main — must differ.
         assert key != build_session_key(source, profile=None)
 
+    def test_discord_adapter_routes_one_authenticated_user_in_shared_channel(
+        self, mock_runner
+    ):
+        mock_runner.config.profile_routes = [
+            ProfileRoute(
+                name="david",
+                platform="discord",
+                profile="owner-shared",
+                guild_id="111",
+                chat_id="222",
+                user_id="david",
+            ),
+            ProfileRoute(
+                name="friends",
+                platform="discord",
+                profile="friends",
+                guild_id="111",
+                chat_id="222",
+            ),
+        ]
+        adapter = _stub_adapter(Platform.DISCORD, mock_runner)
+
+        with patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            return_value=[
+                ("default", Path("/profiles/default")),
+                ("owner-shared", Path("/profiles/owner-shared")),
+                ("friends", Path("/profiles/friends")),
+            ],
+        ):
+            david = adapter.build_source(
+                chat_id="thread",
+                chat_type="group",
+                guild_id="111",
+                parent_chat_id="222",
+                user_id="david",
+            )
+            friend = adapter.build_source(
+                chat_id="thread",
+                chat_type="group",
+                guild_id="111",
+                parent_chat_id="222",
+                user_id="friend",
+            )
+
+        assert david.profile == "owner-shared"
+        assert friend.profile == "friends"
+
+        # The profile stamp is part of the session namespace. David and a
+        # friend in the same Discord thread must never share session state.
+        assert build_session_key(david, profile=david.profile).startswith(
+            "agent:owner-shared:"
+        )
+        assert build_session_key(friend, profile=friend.profile).startswith(
+            "agent:friends:"
+        )
+
     @pytest.mark.asyncio
     async def test_adapter_drops_rejected_route_before_dispatch(self, mock_runner):
         mock_runner.config.multiplex_profile_allowlist = []
@@ -385,5 +442,3 @@ class TestMultiplexGate:
         discord_source.profile = None
 
         assert mock_runner._profile_name_for_source(discord_source) is None
-
-

@@ -14,6 +14,25 @@ class TestProfileRoute:
                          guild_id="g", chat_id="c", thread_id="t")
         assert r.specificity == 14  # 2 + 4 + 8
 
+    def test_authenticated_user_route_outranks_generic_thread(self):
+        owner = ProfileRoute(
+            name="owner",
+            platform="discord",
+            profile="owner-shared",
+            guild_id="g",
+            chat_id="c",
+            user_id="david",
+        )
+        generic_thread = ProfileRoute(
+            name="thread",
+            platform="discord",
+            profile="friends",
+            guild_id="g",
+            chat_id="c",
+            thread_id="t",
+        )
+
+        assert owner.specificity > generic_thread.specificity
 
     def test_frozen(self):
         r = ProfileRoute(name="x", platform="discord", profile="p")
@@ -44,6 +63,36 @@ class TestProfileRouteMatching:
         # guild matches but chat differs -> NO match
         assert not r.matches("discord", guild_id="111", chat_id="333")
 
+    def test_user_route_requires_the_exact_authenticated_sender(self):
+        route = ProfileRoute(
+            name="owner",
+            platform="discord",
+            profile="owner-shared",
+            guild_id="111",
+            chat_id="222",
+            user_id="david",
+        )
+
+        assert route.matches(
+            "discord",
+            guild_id="111",
+            chat_id="thread",
+            parent_chat_id="222",
+            user_id="david",
+        )
+        assert not route.matches(
+            "discord",
+            guild_id="111",
+            chat_id="thread",
+            parent_chat_id="222",
+            user_id="friend",
+        )
+        assert not route.matches(
+            "discord",
+            guild_id="111",
+            chat_id="thread",
+            parent_chat_id="222",
+        )
 
 class TestParseProfileRoutes:
     def test_empty(self):
@@ -52,7 +101,46 @@ class TestParseProfileRoutes:
 
 
 class TestMatchProfileRoute:
+    def test_exact_user_route_wins_over_shared_channel_route(self):
+        routes = parse_profile_routes(
+            [
+                {
+                    "name": "friends",
+                    "platform": "discord",
+                    "guild_id": "g",
+                    "chat_id": "c",
+                    "profile": "friends",
+                },
+                {
+                    "name": "david",
+                    "platform": "discord",
+                    "guild_id": "g",
+                    "chat_id": "c",
+                    "user_id": "david",
+                    "profile": "owner-shared",
+                },
+            ]
+        )
 
+        owner = match_profile_route(
+            routes,
+            "discord",
+            guild_id="g",
+            chat_id="thread",
+            parent_chat_id="c",
+            user_id="david",
+        )
+        friend = match_profile_route(
+            routes,
+            "discord",
+            guild_id="g",
+            chat_id="thread",
+            parent_chat_id="c",
+            user_id="friend",
+        )
+
+        assert owner is not None and owner.profile == "owner-shared"
+        assert friend is not None and friend.profile == "friends"
 
     def test_no_match_returns_none(self):
         routes = [

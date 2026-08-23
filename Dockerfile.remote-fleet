@@ -7,6 +7,7 @@
 FROM docker.io/nousresearch/hermes-agent@sha256:68e15ae2a6d894d0ccbd9f8aacbbe13d4d28fa5dc9b6a303970b67bb2499b1a6
 
 COPY --chown=root:root --chmod=0644 gateway/run.py /opt/hermes/gateway/run.py
+COPY --chown=root:root --chmod=0644 gateway/profile_routing.py /opt/hermes/gateway/profile_routing.py
 COPY --chown=root:root --chmod=0644 gateway/session_context.py /opt/hermes/gateway/session_context.py
 COPY --chown=root:root --chmod=0644 plugins/platforms/discord/adapter.py /opt/hermes/plugins/platforms/discord/adapter.py
 COPY --chown=root:root --chmod=0644 tools/approval.py /opt/hermes/tools/approval.py
