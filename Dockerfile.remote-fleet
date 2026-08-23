@@ -10,5 +10,6 @@ COPY --chown=root:root --chmod=0644 gateway/run.py /opt/hermes/gateway/run.py
 COPY --chown=root:root --chmod=0644 gateway/profile_routing.py /opt/hermes/gateway/profile_routing.py
 COPY --chown=root:root --chmod=0644 gateway/session_context.py /opt/hermes/gateway/session_context.py
 COPY --chown=root:root --chmod=0644 plugins/platforms/discord/adapter.py /opt/hermes/plugins/platforms/discord/adapter.py
+COPY --chown=root:root --chmod=0644 plugins/platforms/discord/friend_code_approval.py /opt/hermes/plugins/platforms/discord/friend_code_approval.py
 COPY --chown=root:root --chmod=0644 tools/approval.py /opt/hermes/tools/approval.py
 COPY --chown=root:root --chmod=0644 tools/mcp_tool.py /opt/hermes/tools/mcp_tool.py
