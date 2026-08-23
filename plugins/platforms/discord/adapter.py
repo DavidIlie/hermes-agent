@@ -1592,24 +1592,28 @@ class DiscordAdapter(BasePlatformAdapter):
             ):
                 return False, False
         else:
-            msg_guild = getattr(message, "guild", None)
-            is_dm = isinstance(message.channel, discord.DMChannel) or msg_guild is None
-            msg_channel_ids = None
-            if not is_dm:
-                msg_channel_ids = {str(message.channel.id)}
-                parent_id = self._get_parent_channel_id(message.channel)
-                if parent_id:
-                    msg_channel_ids.add(parent_id)
-            if not self._is_allowed_user(
-                str(message.author.id),
-                message.author,
-                guild=msg_guild,
-                is_dm=is_dm,
-                channel_ids=msg_channel_ids,
-            ):
-                self._warn_if_fail_closed_default()
+            routed_allowed = self._multiplex_routed_message_authorization(message)
+            if routed_allowed is None:
+                msg_guild = getattr(message, "guild", None)
+                is_dm = isinstance(message.channel, discord.DMChannel) or msg_guild is None
+                msg_channel_ids = None
+                if not is_dm:
+                    msg_channel_ids = {str(message.channel.id)}
+                    parent_id = self._get_parent_channel_id(message.channel)
+                    if parent_id:
+                        msg_channel_ids.add(parent_id)
+                if not self._is_allowed_user(
+                    str(message.author.id),
+                    message.author,
+                    guild=msg_guild,
+                    is_dm=is_dm,
+                    channel_ids=msg_channel_ids,
+                ):
+                    self._warn_if_fail_closed_default()
+                    return False, False
+                role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
+            elif not routed_allowed:
                 return False, False
-            role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
 
         raw_self_mention = self._self_is_explicitly_mentioned(message)
         if not isinstance(message.channel, discord.DMChannel) and (
@@ -1634,6 +1638,81 @@ class DiscordAdapter(BasePlatformAdapter):
                     return False, False
 
         return True, role_authorized
+
+    def _multiplex_routed_message_authorization(
+        self,
+        message: Any,
+    ) -> Optional[bool]:
+        """Authorize a shared-token message against its routed profile.
+
+        A multiplex gateway may serve several isolated profiles through one
+        Discord bot token. Discord permits only one WebSocket consumer for that
+        token, so the primary adapter receives every message. Applying the
+        primary profile's user allowlist here would drop a friend before
+        ``build_source`` can route the event to the friends profile.
+
+        Return ``None`` outside that exact shared-listener case so ordinary and
+        secondary-profile adapters retain their existing local authorization.
+        Routed authorization fails closed and disables adapter delegation to
+        avoid treating the primary adapter's own allowlist as proof.
+        """
+        runner = getattr(self, "gateway_runner", None)
+        runner_config = getattr(runner, "config", None)
+        if (
+            runner is None
+            or getattr(runner_config, "multiplex_profiles", False) is not True
+            or str(getattr(self, "_multiplex_profile_name", "") or "").strip()
+        ):
+            return None
+
+        channel = getattr(message, "channel", None)
+        author = getattr(message, "author", None)
+        if channel is None or author is None or getattr(author, "id", None) is None:
+            return False
+
+        guild = getattr(message, "guild", None) or getattr(channel, "guild", None)
+        is_dm = isinstance(channel, discord.DMChannel) or guild is None
+        is_thread = isinstance(channel, discord.Thread)
+        parent_id = self._get_parent_channel_id(channel) if is_thread else None
+        try:
+            source = self.build_source(
+                chat_id=str(channel.id),
+                chat_name=getattr(channel, "name", None),
+                chat_type="dm" if is_dm else ("thread" if is_thread else "group"),
+                user_id=str(author.id),
+                user_name=(
+                    getattr(author, "display_name", None)
+                    or getattr(author, "name", None)
+                ),
+                thread_id=str(channel.id) if is_thread else None,
+                guild_id=str(guild.id) if guild is not None else None,
+                parent_chat_id=parent_id,
+                message_id=str(getattr(message, "id", "") or "") or None,
+            )
+            if getattr(source, "profile_route_rejected", False) is True:
+                return False
+
+            # ``build_source`` resolves the profile before this point. Enter
+            # that profile's secret scope so DISCORD_ALLOW_ALL_USERS and the
+            # profile-specific allowlist are authoritative for this sender.
+            from gateway.run import _profile_runtime_scope
+
+            profile_home = runner._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                return bool(
+                    runner._is_user_authorized(
+                        source,
+                        allow_adapter_delegation=False,
+                    )
+                )
+        except Exception:
+            logger.warning(
+                "[%s] Routed Discord admission failed closed for message %s",
+                self.name,
+                getattr(message, "id", "unknown"),
+                exc_info=True,
+            )
+            return False
 
     async def _dispatch_discord_message(self, message: Any) -> bool:
         """Apply Discord ingress policy and dispatch one live event."""
@@ -6596,6 +6675,22 @@ class DiscordAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
 
+    def _discord_auto_thread_free_response_channels(self) -> bool:
+        """Whether mention-free response channels should remain thread-first.
+
+        Free-response channels historically implied inline replies. Some
+        deployments instead use a channel as a thread launcher: every message
+        is relevant without a mention, but each request still belongs in its
+        own Discord thread. Keep the historical default and make that shape an
+        explicit per-adapter opt-in.
+        """
+        configured = self.config.extra.get("auto_thread_free_response_channels")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return False
+
     def _discord_allow_any_attachment(self) -> bool:
         """Return whether Discord attachments bypass the SUPPORTED_DOCUMENT_TYPES allowlist.
 
@@ -8743,7 +8838,10 @@ class DiscordAdapter(BasePlatformAdapter):
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels = self._get_no_thread_channels()
-            skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
+            skip_thread = bool(channel_keys & no_thread_channels) or (
+                is_free_channel
+                and not self._discord_auto_thread_free_response_channels()
+            )
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:

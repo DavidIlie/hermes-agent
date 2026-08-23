@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 from datetime import datetime, timezone
+from contextlib import nullcontext
 from unittest.mock import AsyncMock, MagicMock
 import sys
 
@@ -56,10 +57,16 @@ class FakeDMChannel:
 
 
 class FakeTextChannel:
-    def __init__(self, channel_id: int = 1, name: str = "general", guild_name: str = "Hermes Server"):
+    def __init__(
+        self,
+        channel_id: int = 1,
+        name: str = "general",
+        guild_name: str = "Hermes Server",
+        guild_id: int = 1540757211146493993,
+    ):
         self.id = channel_id
         self.name = name
-        self.guild = SimpleNamespace(name=guild_name)
+        self.guild = SimpleNamespace(name=guild_name, id=guild_id)
         self.topic = None
 
 
@@ -87,17 +94,118 @@ def adapter(monkeypatch):
 
 
 def make_message(*, channel, content: str, mentions=None):
-    author = SimpleNamespace(id=42, display_name="TestUser", name="TestUser")
+    author = SimpleNamespace(
+        id=42,
+        display_name="TestUser",
+        name="TestUser",
+        bot=False,
+    )
     return SimpleNamespace(
         id=123,
         content=content,
         mentions=list(mentions or []),
         attachments=[],
         reference=None,
+        type=discord_platform.discord.MessageType.default,
         created_at=datetime.now(timezone.utc),
         channel=channel,
         author=author,
+        guild=getattr(channel, "guild", None),
     )
+
+
+def test_multiplex_primary_admission_uses_routed_profile_authorization(
+    adapter, monkeypatch,
+):
+    """A shared-token listener must not apply its owner's user allowlist first.
+
+    The primary Discord adapter owns the one WebSocket connection, but the
+    gateway route owns authorization. Otherwise an allow-all friends profile
+    can never receive a message because the owner's adapter drops it before a
+    SessionSource exists.
+    """
+    adapter._allowed_user_ids = {"243009043260637184"}
+    runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=True),
+        _profile_name_for_source=lambda _source: "friends",
+        _resolve_profile_home_for_source=lambda _source: "/profiles/friends",
+        _is_user_authorized=lambda source, **_kwargs: source.profile == "friends",
+    )
+    adapter.gateway_runner = runner
+    monkeypatch.setattr(
+        "gateway.run._profile_runtime_scope",
+        lambda _home: nullcontext(),
+    )
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=1540773031436353708),
+        content="hello herm",
+    )
+
+    admitted, role_authorized = adapter._discord_message_admission(
+        message, claim=False,
+    )
+
+    assert admitted is True
+    assert role_authorized is False
+
+
+def test_multiplex_primary_admission_rejects_unrouted_shared_sender(
+    adapter, monkeypatch,
+):
+    """Moving authorization behind routing must not open unrelated channels."""
+    adapter._allowed_user_ids = {"243009043260637184"}
+    runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=True),
+        _profile_name_for_source=lambda _source: None,
+        _resolve_profile_home_for_source=lambda _source: "/profiles/default",
+        _is_user_authorized=lambda _source, **_kwargs: False,
+    )
+    adapter.gateway_runner = runner
+    monkeypatch.setattr(
+        "gateway.run._profile_runtime_scope",
+        lambda _home: nullcontext(),
+    )
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=999999),
+        content="<@999> try another channel",
+        mentions=[adapter._client.user],
+    )
+
+    assert adapter._discord_message_admission(message, claim=False) == (
+        False,
+        False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_free_response_channel_can_still_auto_thread_when_enabled(
+    adapter, monkeypatch,
+):
+    """Mention-free channels can opt into thread-first conversations."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "789")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+    adapter.config.extra["auto_thread_free_response_channels"] = True
+    adapter._auto_create_thread = AsyncMock(
+        return_value=FakeThread(
+            channel_id=999,
+            parent=FakeTextChannel(channel_id=789),
+        )
+    )
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=789),
+        content="new thread without a mention",
+    )
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "thread"
+    assert event.source.parent_chat_id == "789"
 
 
 # ── ignored_channels ─────────────────────────────────────────────────
@@ -238,5 +346,3 @@ def test_config_bridges_ignored_channels(monkeypatch, tmp_path):
 
     import os
     assert os.getenv("DISCORD_IGNORED_CHANNELS") == "111,222"
-
-
