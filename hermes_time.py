@@ -19,7 +19,6 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
-from hermes_constants import get_config_path
 from typing import Iterator, Optional
 
 logger = logging.getLogger(__name__)
@@ -60,21 +59,11 @@ def _resolve_timezone_name() -> str:
 
     # 2. config.yaml ``timezone`` key
     try:
-        # Prefer the shared cached raw-config reader (mtime/size-keyed cache +
-        # libyaml C loader) — a direct yaml.safe_load of a large config.yaml
-        # costs ~100ms+ and this used to run inside the FIRST system prompt
-        # build, on the time-to-first-token critical path.
-        try:
-            from hermes_cli.config import read_raw_config
-            cfg = read_raw_config() or {}
-        except Exception:
-            import yaml
-            config_path = get_config_path()
-            if config_path.exists():
-                with open(config_path, encoding="utf-8") as f:
-                    cfg = yaml.safe_load(f) or {}
-            else:
-                cfg = {}
+        # Use the config module's raw reader so this stays inside the shared
+        # cache and config-read policy boundary.
+        from hermes_cli.config import read_user_config_raw
+
+        cfg = read_user_config_raw() or {}
         if cfg:
             # Managed scope: an administrator can pin ``timezone`` too. Overlay
             # via the shared helper (fail-open) since this reads config.yaml directly.
@@ -129,9 +118,9 @@ def _profile_timezone_name(profile_home: str | Path) -> str:
     try:
         if not config_path.exists():
             return ""
-        import yaml
+        from hermes_cli.config import read_user_config_raw
 
-        cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        cfg = read_user_config_raw(config_path) or {}
         value = cfg.get("timezone", "") if isinstance(cfg, dict) else ""
         return value.strip() if isinstance(value, str) else ""
     except Exception as exc:
@@ -183,4 +172,3 @@ def now() -> datetime:
         return datetime.now(tz)
     # No timezone configured — use server-local (still tz-aware)
     return datetime.now().astimezone()
-
