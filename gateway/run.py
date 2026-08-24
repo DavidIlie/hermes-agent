@@ -2052,12 +2052,14 @@ def _profile_runtime_scope(profile_home: "Path"):
         reset_secret_scope,
     )
     from hermes_cli.env_loader import hydrate_profile_secret_sources
+    from hermes_time import use_profile_timezone
 
     home_token = set_hermes_home_override(str(profile_home))
     hydrate_profile_secret_sources(Path(profile_home))
     secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
     try:
-        yield
+        with use_profile_timezone(profile_home):
+            yield
     finally:
         reset_secret_scope(secret_token)
         reset_hermes_home_override(home_token)
@@ -16197,10 +16199,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Preserve built-in precedence; aliases only need early handling when
         # the typed command is not already known.
         if command and _cmd_def is None:
-            if isinstance(self.config, dict):
-                quick_commands = self.config.get("quick_commands", {}) or {}
-            else:
-                quick_commands = getattr(self.config, "quick_commands", {}) or {}
+            quick_commands = self._quick_commands_for_source(source)
             if isinstance(quick_commands, dict) and command in quick_commands:
                 qcmd = quick_commands[command]
                 if qcmd.get("type") == "alias":
@@ -16658,12 +16657,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
-            if isinstance(self.config, dict):
-                quick_commands = self.config.get("quick_commands", {}) or {}
-            else:
-                quick_commands = getattr(self.config, "quick_commands", {}) or {}
-            if not isinstance(quick_commands, dict):
-                quick_commands = {}
+            quick_commands = self._quick_commands_for_source(source)
             if command in quick_commands:
                 # Quick commands are slash capabilities too — and type:exec
                 # ones run a shell command in the gateway process. The early
@@ -20037,7 +20031,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not canonical_cmd:
             return None
         policy_config = self.config
-        profile_name = str(getattr(source, "profile", "") or "").strip()
+        raw_profile = getattr(source, "profile", "")
+        profile_name = raw_profile.strip() if isinstance(raw_profile, str) else ""
         if profile_name:
             try:
                 from gateway.config import load_gateway_config
@@ -20088,6 +20083,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "or to set user_allowed_commands."
             )
         return f"⛔ /{canonical_cmd} is admin-only here. {suffix}"
+
+    def _quick_commands_for_source(self, source: SessionSource) -> dict:
+        """Resolve quick commands from the source's multiplex profile.
+
+        The gateway process owns one root config, but multiplexed Discord
+        tenants have separate profile homes. Reading ``self.config`` here made
+        profile-local commands invisible and, worse, could expose an owner's
+        command to another profile. Match the existing slash-policy isolation:
+        load the named profile under its runtime scope and fail closed.
+        """
+        resolved_config = self.config
+        raw_profile = getattr(source, "profile", "")
+        profile_name = raw_profile.strip() if isinstance(raw_profile, str) else ""
+        if profile_name:
+            try:
+                from gateway.config import load_gateway_config
+                from hermes_cli.profiles import get_active_profile_name, get_profile_dir
+
+                active_profile = get_active_profile_name() or "default"
+                if profile_name != active_profile:
+                    profile_home = get_profile_dir(profile_name)
+                    with _profile_runtime_scope(profile_home):
+                        resolved_config = load_gateway_config()
+            except Exception as exc:
+                logger.error(
+                    "Quick commands unavailable: could not load policy for "
+                    "multiplex profile %r: %s",
+                    profile_name,
+                    exc,
+                    exc_info=True,
+                )
+                return {}
+        if isinstance(resolved_config, dict):
+            commands = resolved_config.get("quick_commands", {}) or {}
+        else:
+            commands = getattr(resolved_config, "quick_commands", {}) or {}
+        return commands if isinstance(commands, dict) else {}
 
 
 

@@ -216,6 +216,21 @@ def test_event_from_wire_reply_to_absent_and_partial():
 # ── hello command manifest ───────────────────────────────────────────────
 
 
+def test_relay_command_manifest_includes_bostan_meme_command():
+    manifest = build_relay_command_manifest()
+    meme = next(row for row in manifest if row["name"] == "meme")
+    assert meme == {
+        "name": "meme",
+        "description": "Generate another Bostan mindset poster",
+    }
+
+
+def test_relay_command_manifest_names_are_valid_and_unique():
+    names = [row["name"] for row in build_relay_command_manifest()]
+    assert len(names) == len(set(names))
+    assert all(re.fullmatch(r"[a-z0-9_-]{1,32}", name) for name in names)
+
+
 
 
 # ── auto-thread routing feedback (send-result thread_id) ─────────────────

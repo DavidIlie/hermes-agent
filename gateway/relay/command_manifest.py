@@ -142,4 +142,8 @@ def build_relay_command_manifest() -> List[Dict[str, Any]]:
             "description": "Run a prompt in the background",
             "options": [_opt("text", "The prompt to run")],
         },
+        {
+            "name": "meme",
+            "description": "Generate another Bostan mindset poster",
+        },
     ]
