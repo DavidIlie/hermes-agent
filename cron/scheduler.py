@@ -3279,7 +3279,7 @@ def _preflight_check_provider_key(job: dict, cfg: dict) -> Optional[str]:
     return None
 
 
-def _preflight_check_delivery(job: dict) -> Optional[str]:
+def _preflight_check_delivery(job: dict, *, adapters=None) -> Optional[str]:
     """Check the job's delivery target(s) resolve to configured platforms.
 
     ``local``/``origin`` (and the ``all`` routing token) need no gateway
@@ -3302,6 +3302,7 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
         return None
 
     connected: Optional[set] = None
+    gateway_config = None
     for platform_name in platform_parts:
         if not _is_known_delivery_platform(platform_name):
             return (
@@ -3324,6 +3325,28 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
                     "delivery credential check", exc_info=True,
                 )
                 return None  # fail-open
+        # Multiplex profiles deliberately do not carry a second copy of the
+        # shared gateway credential.  When cron runs in-process, consult the
+        # exact live transport map that fire-time delivery will use before
+        # rejecting the profile-local config as unconnected.  This keeps
+        # preflight and delivery on the same routing contract without weakening
+        # standalone cron, which still requires its own configured credential.
+        if adapters:
+            try:
+                from gateway.config import Platform
+                from gateway.delivery import resolve_delivery_transport
+
+                logical_platform = Platform(platform_name.lower())
+                if resolve_delivery_transport(
+                    logical_platform, gateway_config, adapters,
+                ) is not None:
+                    continue
+            except Exception:
+                logger.debug(
+                    "preflight: live delivery transport resolution failed; "
+                    "falling back to configured-platform validation",
+                    exc_info=True,
+                )
         if platform_name.lower() not in connected:
             return (
                 f"delivery platform '{platform_name}' has no gateway "
@@ -3389,7 +3412,7 @@ def _preflight_check_skills(job: dict) -> Optional[str]:
     return None
 
 
-def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
+def _preflight_job_config(job: dict, cfg: dict, *, adapters=None) -> Optional[str]:
     """Pre-dispatch configuration validation (T1-26).
 
     Returns a human-readable reason when the job's configuration cannot
@@ -3408,7 +3431,7 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
     for name, check in (
         ("provider_key", lambda: _preflight_check_provider_key(job, cfg)),
         ("skills", lambda: _preflight_check_skills(job)),
-        ("delivery", lambda: _preflight_check_delivery(job)),
+        ("delivery", lambda: _preflight_check_delivery(job, adapters=adapters)),
     ):
         try:
             reason = check()
@@ -3424,7 +3447,7 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
 
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None,
-    extra_prompt: Optional[str] = None,
+    extra_prompt: Optional[str] = None, adapters=None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -4088,7 +4111,9 @@ def run_job(
         _pf_reason = None
         try:
             if _cron_preflight_enabled(_cfg):
-                _pf_reason = _preflight_job_config(job, _cfg)
+                _pf_reason = _preflight_job_config(
+                    job, _cfg, adapters=adapters,
+                )
                 if not _pf_reason and job.get("preflight_alerted"):
                     # Configuration validates again — clear the alert-once
                     # marker so a FUTURE config break re-alerts.
@@ -4889,7 +4914,7 @@ def run_one_job(
         try:
             success, output, final_response, error = run_job(
                 job, defer_agent_teardown=_deferred_agents,
-                extra_prompt=extra_prompt,
+                extra_prompt=extra_prompt, adapters=adapters,
             )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear

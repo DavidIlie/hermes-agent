@@ -48,6 +48,25 @@ from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 
 
 @pytest.mark.asyncio
+async def test_send_rejects_direct_message_destination_in_channel_only_mode():
+    """Scheduled or tool-driven sends cannot turn a DM into a hidden channel."""
+    adapter = DiscordAdapter(
+        PlatformConfig(enabled=True, token="***", extra={"allow_dms": False})
+    )
+    dm_channel = SimpleNamespace(guild=None, send=AsyncMock())
+    adapter._client = SimpleNamespace(
+        get_channel=MagicMock(return_value=dm_channel),
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send("555", "channel-only")
+
+    assert result.success is False
+    assert "direct-message delivery is disabled" in result.error
+    dm_channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_send_rejects_whitespace_and_records_failed_final_reply(
     caplog, monkeypatch, tmp_path
 ):
@@ -416,5 +435,4 @@ async def test_send_file_attachment_forum_uses_files_kwarg(tmp_path, monkeypatch
     thread_kwargs = forum_channel.create_thread.await_args.kwargs
     assert thread_kwargs.get("file") is None
     assert isinstance(thread_kwargs.get("files"), list) and len(thread_kwargs["files"]) == 1
-
 
