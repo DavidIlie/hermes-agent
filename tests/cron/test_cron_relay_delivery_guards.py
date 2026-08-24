@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cron import scheduler as sched
+from gateway.config import Platform
 from cron.scheduler import (
     _preflight_check_delivery,
     _resolve_single_delivery_target,
@@ -101,6 +102,7 @@ class TestOriginThreadStaleGuard:
 
 def _gateway_config(connected_values):
     config = MagicMock()
+    config.platforms = {}
     config.get_connected_platforms.return_value = [
         MagicMock(value=v) for v in connected_values
     ]
@@ -108,6 +110,33 @@ def _gateway_config(connected_values):
 
 
 class TestPreflightRelayFronted:
+    def test_shared_live_discord_adapter_accepted(self, monkeypatch):
+        """A multiplex profile can deliver through the primary live adapter."""
+        monkeypatch.delenv("GATEWAY_RELAY_PLATFORMS", raising=False)
+        live_discord = MagicMock()
+        with patch(
+            "gateway.config.load_gateway_config",
+            return_value=_gateway_config(set()),
+        ):
+            assert _preflight_check_delivery(
+                {"deliver": "discord:1540773141171933304"},
+                adapters={Platform.DISCORD: live_discord},
+            ) is None
+
+    def test_profile_without_live_discord_adapter_still_rejected(self, monkeypatch):
+        """The shared-transport exception cannot weaken standalone cron."""
+        monkeypatch.delenv("GATEWAY_RELAY_PLATFORMS", raising=False)
+        with patch(
+            "gateway.config.load_gateway_config",
+            return_value=_gateway_config(set()),
+        ):
+            reason = _preflight_check_delivery(
+                {"deliver": "discord:1540773141171933304"},
+                adapters={},
+            )
+        assert reason is not None
+        assert "discord" in reason
+
     def test_relay_fronted_slack_accepted(self, monkeypatch):
         """Relay-only topology fronting slack: slack:CHAT passes preflight."""
         monkeypatch.setenv("GATEWAY_RELAY_PLATFORMS", "slack")

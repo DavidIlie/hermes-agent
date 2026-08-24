@@ -179,6 +179,57 @@ def test_multiplex_primary_admission_rejects_unrouted_shared_sender(
     )
 
 
+def test_direct_message_is_rejected_before_profile_routing(adapter):
+    """Channel-only mode drops DMs before routing, sessions, or model work."""
+    adapter.config.extra["allow_dms"] = False
+    adapter._allowed_user_ids = {"42"}
+    adapter.gateway_runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=True),
+        _resolve_profile_home_for_source=MagicMock(
+            side_effect=AssertionError("DM must not reach profile routing")
+        ),
+    )
+    message = make_message(
+        channel=FakeDMChannel(channel_id=1234),
+        content="private message",
+    )
+
+    assert adapter._discord_message_admission(message, claim=False) == (
+        False,
+        False,
+    )
+    adapter.gateway_runner._resolve_profile_home_for_source.assert_not_called()
+
+
+def test_direct_message_slash_command_is_rejected(adapter):
+    """Slash commands cannot bypass channel-only mode through a DM."""
+    adapter.config.extra["allow_dms"] = False
+    interaction = SimpleNamespace(
+        channel=FakeDMChannel(channel_id=1234),
+        channel_id=1234,
+        guild=None,
+        guild_id=None,
+        user=SimpleNamespace(id=42, name="TestUser"),
+    )
+
+    allowed, reason = adapter._evaluate_slash_authorization(
+        interaction, "/status",
+    )
+
+    assert allowed is False
+    assert reason == "Discord direct messages are disabled"
+
+
+def test_yaml_channel_only_setting_seeds_adapter_config(monkeypatch):
+    # Register the key with monkeypatch before the bridge mutates os.environ so
+    # teardown removes the bridged value instead of leaking it to later tests.
+    monkeypatch.setenv("DISCORD_ALLOW_DMS", "")
+
+    extra = discord_platform._apply_yaml_config({}, {"allow_dms": False})
+
+    assert extra["allow_dms"] == "false"
+
+
 @pytest.mark.asyncio
 async def test_free_response_channel_can_still_auto_thread_when_enabled(
     adapter, monkeypatch,

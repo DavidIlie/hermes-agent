@@ -297,6 +297,7 @@ class InProcessCronScheduler(CronScheduler):
             use_cron_store,
         )
         from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        from hermes_time import use_profile_timezone
 
         logger = logging.getLogger("cron.scheduler_provider")
         logger.info(
@@ -310,7 +311,7 @@ class InProcessCronScheduler(CronScheduler):
             home = entry[1] if isinstance(entry, tuple) else entry
             home_token = set_hermes_home_override(str(home))
             try:
-                with use_cron_store(home):
+                with use_cron_store(home), use_profile_timezone(home):
                     recovered = self.recover_interrupted()
                     if recovered:
                         logger.warning(
@@ -332,7 +333,7 @@ class InProcessCronScheduler(CronScheduler):
                         home = entry[1] if isinstance(entry, tuple) else entry
                         home_token = set_hermes_home_override(str(home))
                         try:
-                            with use_cron_store(home):
+                            with use_cron_store(home), use_profile_timezone(home):
                                 cron_tick(
                                     verbose=False,
                                     adapters=adapters,
@@ -353,7 +354,7 @@ class InProcessCronScheduler(CronScheduler):
                 home = entry[1] if isinstance(entry, tuple) else entry
                 home_token = set_hermes_home_override(str(home))
                 try:
-                    with use_cron_store(home):
+                    with use_cron_store(home), use_profile_timezone(home):
                         record_ticker_heartbeat(success=ok)
                         # Surface the failure reason (or clear it) per profile
                         # so `hermes cron status` can show WHY ticks fail

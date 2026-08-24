@@ -15,9 +15,11 @@ crashes due to a bad timezone string.
 
 import logging
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
-from hermes_constants import get_config_path
-from typing import Optional
+from pathlib import Path
+from typing import Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,16 @@ _cached_tz: Optional[ZoneInfo] = None
 _cached_tz_name: Optional[str] = None
 _cache_resolved: bool = False
 
+# A multiplex gateway serves profiles with independent config files in one
+# process.  The process-level cache above remains the fast path for legacy
+# single-profile gateways, while this context-local override prevents the
+# primary profile's HERMES_TIMEZONE/cache from leaking into a secondary turn
+# or cron tick.
+_timezone_override: ContextVar[Optional[str]] = ContextVar(
+    "hermes_timezone_override",
+    default=None,
+)
+
 
 def _resolve_timezone_name() -> str:
     """Read the configured IANA timezone string (or empty string).
@@ -47,21 +59,11 @@ def _resolve_timezone_name() -> str:
 
     # 2. config.yaml ``timezone`` key
     try:
-        # Prefer the shared cached raw-config reader (mtime/size-keyed cache +
-        # libyaml C loader) — a direct yaml.safe_load of a large config.yaml
-        # costs ~100ms+ and this used to run inside the FIRST system prompt
-        # build, on the time-to-first-token critical path.
-        try:
-            from hermes_cli.config import read_raw_config
-            cfg = read_raw_config() or {}
-        except Exception:
-            import yaml
-            config_path = get_config_path()
-            if config_path.exists():
-                with open(config_path, encoding="utf-8") as f:
-                    cfg = yaml.safe_load(f) or {}
-            else:
-                cfg = {}
+        # Use the config module's raw reader so this stays inside the shared
+        # cache and config-read policy boundary.
+        from hermes_cli.config import read_user_config_raw
+
+        cfg = read_user_config_raw() or {}
         if cfg:
             # Managed scope: an administrator can pin ``timezone`` too. Overlay
             # via the shared helper (fail-open) since this reads config.yaml directly.
@@ -98,12 +100,51 @@ def get_timezone() -> Optional[ZoneInfo]:
 
     Resolved once and cached. Call ``reset_cache()`` after config changes.
     """
+    override = _timezone_override.get()
+    if override is not None:
+        return _get_zoneinfo(override)
+
     global _cached_tz, _cached_tz_name, _cache_resolved
     if not _cache_resolved:
         _cached_tz_name = _resolve_timezone_name()
         _cached_tz = _get_zoneinfo(_cached_tz_name)
         _cache_resolved = True
     return _cached_tz
+
+
+def _profile_timezone_name(profile_home: str | Path) -> str:
+    """Read one profile's explicit timezone without consulting process env."""
+    config_path = Path(profile_home).expanduser().resolve() / "config.yaml"
+    try:
+        if not config_path.exists():
+            return ""
+        from hermes_cli.config import read_user_config_raw
+
+        cfg = read_user_config_raw(config_path) or {}
+        value = cfg.get("timezone", "") if isinstance(cfg, dict) else ""
+        return value.strip() if isinstance(value, str) else ""
+    except Exception as exc:
+        logger.warning(
+            "Could not read timezone from profile config %s: %s",
+            config_path,
+            exc,
+        )
+        return ""
+
+
+@contextmanager
+def use_profile_timezone(profile_home: str | Path) -> Iterator[None]:
+    """Scope ``now()`` to a profile's configured timezone when it has one."""
+    timezone_name = _profile_timezone_name(profile_home)
+    if not timezone_name:
+        yield
+        return
+
+    token = _timezone_override.set(timezone_name)
+    try:
+        yield
+    finally:
+        _timezone_override.reset(token)
 
 
 def reset_cache() -> None:
@@ -131,5 +172,3 @@ def now() -> datetime:
         return datetime.now(tz)
     # No timezone configured — use server-local (still tz-aware)
     return datetime.now().astimezone()
-
-

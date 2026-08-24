@@ -1,6 +1,7 @@
 """Tests for user-defined quick commands that bypass the agent loop."""
 import os
 import subprocess
+from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 from rich.text import Text
 import pytest
@@ -175,3 +176,26 @@ class TestGatewayQuickCommands:
         event = self._make_event("limits")
         result = await runner._handle_message(event)
         assert result == "ok"
+
+    def test_named_profile_uses_its_own_quick_commands(self, monkeypatch, tmp_path):
+        from gateway import run as gateway_run
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            quick_commands={"owner-only": {"type": "exec", "command": "echo no"}}
+        )
+        friends_config = GatewayConfig(
+            quick_commands={"meme": {"type": "exec", "command": "echo yes"}}
+        )
+        source = MagicMock()
+        source.profile = "friends-david"
+        monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
+        monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda _name: tmp_path)
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: friends_config)
+        monkeypatch.setattr(gateway_run, "_profile_runtime_scope", lambda _home: nullcontext())
+
+        assert runner._quick_commands_for_source(source) == {
+            "meme": {"type": "exec", "command": "echo yes"}
+        }

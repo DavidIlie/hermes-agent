@@ -414,3 +414,41 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
 
 
+def test_multiplex_ticker_uses_each_profiles_timezone(tmp_path, monkeypatch):
+    """A process-level timezone must not leak into secondary cron profiles."""
+    from cron.scheduler_provider import InProcessCronScheduler
+    import hermes_time
+
+    p1 = tmp_path / "default"
+    p2 = tmp_path / "friends-david"
+    for home, timezone_name in (
+        (p1, "Europe/Madrid"),
+        (p2, "Europe/Bucharest"),
+    ):
+        (home / "cron").mkdir(parents=True)
+        (home / "config.yaml").write_text(
+            f"timezone: {timezone_name}\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setenv("HERMES_TIMEZONE", "Europe/Madrid")
+    hermes_time.reset_cache()
+    observed: list[str] = []
+    stop = threading.Event()
+
+    def _capture_timezone(*args, **kwargs):
+        observed.append(str(hermes_time.now().tzinfo))
+        if len(observed) == 2:
+            stop.set()
+        return 0
+
+    with patch("cron.scheduler.tick", side_effect=_capture_timezone), \
+         patch("cron.jobs.record_ticker_heartbeat", lambda **kw: None):
+        InProcessCronScheduler().start(
+            stop,
+            interval=0,
+            profile_homes=[("default", p1), ("friends-david", p2)],
+        )
+
+    assert observed == ["Europe/Madrid", "Europe/Bucharest"]
+

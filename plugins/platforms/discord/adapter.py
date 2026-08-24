@@ -428,6 +428,7 @@ _GATE_ENV_KEYS = (
     "DISCORD_NO_THREAD_CHANNELS",
     "DISCORD_FREE_RESPONSE_CHANNELS",
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS",
+    "DISCORD_ALLOW_DMS",
     "DISCORD_ALLOW_ALL_USERS",
     "DISCORD_ALLOW_BOTS",
     "GATEWAY_ALLOW_ALL_USERS",
@@ -1577,6 +1578,18 @@ class DiscordAdapter(BasePlatformAdapter):
         if message.author == self._client.user:
             return False, False
         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
+            return False, False
+
+        channel = getattr(message, "channel", None)
+        guild = getattr(message, "guild", None) or getattr(channel, "guild", None)
+        is_dm = isinstance(channel, discord.DMChannel) or guild is None
+        if is_dm and not self._discord_allow_dms():
+            logger.info(
+                "[%s] Ignoring Discord DM before authorization: user=%s channel=%s",
+                self.name,
+                getattr(getattr(message, "author", None), "id", "unknown"),
+                getattr(channel, "id", "unknown"),
+            )
             return False, False
 
         role_authorized = False
@@ -3562,6 +3575,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 if not channel:
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
 
+            if self._discord_dm_send_blocked(channel):
+                return self._discord_dm_send_rejection()
+
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
                 result = await self._send_to_forum(channel, content)
@@ -3821,6 +3837,8 @@ class DiscordAdapter(BasePlatformAdapter):
             channel = self._client.get_channel(int(chat_id))
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
+            if self._discord_dm_send_blocked(channel):
+                return self._discord_dm_send_rejection()
             msg = channel.get_partial_message(int(message_id))
             formatted = self.format_message(content)
 
@@ -4047,6 +4065,8 @@ class DiscordAdapter(BasePlatformAdapter):
             channel = await self._client.fetch_channel(int(chat_id))
         if not channel:
             return SendResult(success=False, error=f"Channel {chat_id} not found")
+        if self._discord_dm_send_blocked(channel):
+            return self._discord_dm_send_rejection()
 
         filename = file_name or os.path.basename(file_path)
         logger.info(
@@ -4125,6 +4145,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel = await self._client.fetch_channel(int(chat_id))
             if not channel:
                 logger.warning("[%s] Channel %s not found for multi-image send", self.name, chat_id)
+                return
+            if self._discord_dm_send_blocked(channel):
+                logger.info("[%s] Refusing Discord DM media delivery", self.name)
                 return
         except Exception as e:
             logger.warning("[%s] Failed to resolve channel for multi-image send: %s", self.name, e)
@@ -4256,6 +4279,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel = await self._client.fetch_channel(int(chat_id))
             if not channel:
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
+            if self._discord_dm_send_blocked(channel):
+                return self._discord_dm_send_rejection()
 
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=f"Audio file not found: {audio_path}")
@@ -5240,7 +5265,12 @@ class DiscordAdapter(BasePlatformAdapter):
         an opaque interaction failure rather than a clean rejection.
         """
         chan_obj = getattr(interaction, "channel", None)
-        in_dm = isinstance(chan_obj, discord.DMChannel) if chan_obj is not None else False
+        guild_id = getattr(interaction, "guild_id", None)
+        in_dm = isinstance(chan_obj, discord.DMChannel) or (
+            not bool(guild_id) and getattr(interaction, "guild", None) is None
+        )
+        if in_dm and not self._discord_allow_dms():
+            return (False, "Discord direct messages are disabled")
 
         channel_ids: set = set()
         channel_keys: set = set()
@@ -5520,6 +5550,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel = await self._client.fetch_channel(int(chat_id))
             if not channel:
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
+            if self._discord_dm_send_blocked(channel):
+                return self._discord_dm_send_rejection()
 
             # Download the image and send as a Discord file attachment
             # (Discord renders attachments inline, unlike plain URLs)
@@ -5602,6 +5634,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel = await self._client.fetch_channel(int(chat_id))
             if not channel:
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
+            if self._discord_dm_send_blocked(channel):
+                return self._discord_dm_send_rejection()
 
             # Download the GIF and send as a Discord file attachment
             # (Discord renders .gif attachments as auto-playing animations inline)
@@ -6804,6 +6838,39 @@ class DiscordAdapter(BasePlatformAdapter):
     def _get_no_thread_channels(self) -> set:
         """This adapter's DISCORD_NO_THREAD_CHANNELS list (per-profile)."""
         return self._gate_csv_set(self._gate_raw("no_thread_channels", "DISCORD_NO_THREAD_CHANNELS"))
+
+    def _discord_allow_dms(self) -> bool:
+        """Whether Discord direct-message ingress and egress are enabled.
+
+        The default stays enabled for backwards compatibility. Deployments
+        that require channel-only operation set ``discord.allow_dms: false``;
+        the gate is snapshotted per adapter so multiplexed profiles cannot
+        overwrite one another through process-global environment state.
+        """
+        raw = self._gate_raw("allow_dms", "DISCORD_ALLOW_DMS")
+        if raw is None or str(raw).strip() == "":
+            return True
+        return str(raw).strip().lower() in {"true", "1", "yes", "on"}
+
+    @staticmethod
+    def _discord_channel_is_dm(channel: Any) -> bool:
+        """Return whether a resolved Discord destination is private."""
+        if channel is None:
+            return False
+        return (
+            isinstance(channel, discord.DMChannel)
+            or getattr(channel, "guild", None) is None
+        )
+
+    def _discord_dm_send_blocked(self, channel: Any) -> bool:
+        return not self._discord_allow_dms() and self._discord_channel_is_dm(channel)
+
+    @staticmethod
+    def _discord_dm_send_rejection() -> SendResult:
+        return SendResult(
+            success=False,
+            error="Discord direct-message delivery is disabled; use a server channel",
+        )
 
     def _get_allowed_users(self) -> set:
         """This adapter's DISCORD_ALLOWED_USERS entries (per-profile, cleaned)."""
@@ -11200,6 +11267,14 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         seeded_extra["allow_all_users"] = str(allow_all_cfg).lower()
         if not _skip_env_bridge and not os.getenv("DISCORD_ALLOW_ALL_USERS"):
             os.environ["DISCORD_ALLOW_ALL_USERS"] = str(allow_all_cfg).lower()
+    allow_dms_cfg = (
+        discord_cfg["allow_dms"] if "allow_dms" in discord_cfg
+        else platform_extra_cfg.get("allow_dms")
+    )
+    if allow_dms_cfg is not None:
+        seeded_extra["allow_dms"] = str(allow_dms_cfg).lower()
+        if not _skip_env_bridge and not os.getenv("DISCORD_ALLOW_DMS"):
+            os.environ["DISCORD_ALLOW_DMS"] = str(allow_dms_cfg).lower()
     approval_mentions_cfg = (
         discord_cfg["approval_mentions"] if "approval_mentions" in discord_cfg
         else platform_extra_cfg.get("approval_mentions")
@@ -11347,7 +11422,7 @@ def register(ctx) -> None:
         setup_fn=interactive_setup,
         # YAML→env config bridge — owns the translation of ``config.yaml``
         # ``discord:`` keys (require_mention, free_response_channels,
-        # auto_thread, reactions, ignored_channels, allowed_channels,
+        # auto_thread, reactions, allow_dms, ignored_channels, allowed_channels,
         # no_thread_channels, allow_mentions.*, reply_to_mode,
         # thread_require_mention) into ``DISCORD_*`` env vars that the
         # adapter reads via ``os.getenv()``.  Replaces the hardcoded block
