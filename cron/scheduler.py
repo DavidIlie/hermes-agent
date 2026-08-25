@@ -1969,7 +1969,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
         from gateway.delivery import resolve_delivery_transport
 
-        transport = resolve_delivery_transport(platform, config, adapters)
+        transport = resolve_delivery_transport(
+            platform,
+            config,
+            adapters,
+            allow_shared_native=True,
+        )
         if transport is not None:
             pconfig = transport.config
             runtime_adapter = transport.adapter
@@ -2190,7 +2195,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
-                    router = DeliveryRouter(config, adapters)
+                    router = DeliveryRouter(
+                        config,
+                        adapters,
+                        allow_shared_native_transport=True,
+                    )
                     route_target = DeliveryTarget(
                         platform=platform,
                         chat_id=str(chat_id),
@@ -3338,7 +3347,10 @@ def _preflight_check_delivery(job: dict, *, adapters=None) -> Optional[str]:
 
                 logical_platform = Platform(platform_name.lower())
                 if resolve_delivery_transport(
-                    logical_platform, gateway_config, adapters,
+                    logical_platform,
+                    gateway_config,
+                    adapters,
+                    allow_shared_native=True,
                 ) is not None:
                     continue
             except Exception:

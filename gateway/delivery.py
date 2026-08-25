@@ -93,24 +93,53 @@ def resolve_delivery_transport(
     platform: Platform,
     config: GatewayConfig,
     adapters: Optional[Dict[Platform, Any]],
+    *,
+    allow_shared_native: bool = False,
 ) -> Optional[DeliveryTransport]:
     """Resolve a logical platform to its live delivery transport.
 
-    A concrete native adapter always wins. Relay is eligible only when its
-    authenticated transport explicitly advertises that it fronts the logical
-    platform, which keeps restart-time delivery independent of per-chat caches
-    without letting Relay hijack unrelated platform targets.
+    A concrete native adapter always wins. ``allow_shared_native`` lets the
+    multiplex cron scheduler reuse a connected primary adapter when the active
+    profile intentionally has no duplicate credential. Relay is eligible only
+    when its authenticated transport explicitly advertises that it fronts the
+    logical platform, which keeps restart-time delivery independent of per-chat
+    caches without letting Relay hijack unrelated platform targets.
     """
     live_adapters = adapters or {}
     native = live_adapters.get(platform)
     native_config = config.platforms.get(platform)
+    resolved_native_config = native_config
+    native_enabled = native_config is None or native_config.enabled
+
+    # A multiplex profile intentionally omits the primary gateway's credential,
+    # so its profile-local config is derived as disabled even though the primary
+    # process already has a connected adapter.  Cron is the only caller allowed
+    # to opt into that shared live adapter.  Preserve an explicit profile-level
+    # ``enabled: false`` and require the adapter's own runtime config to be
+    # enabled, so this cannot revive a deliberately disabled or disconnected
+    # transport.
+    explicitly_disabled = bool(
+        native_config is not None
+        and not native_config.enabled
+        and native_config.extra.get("_enabled_explicit", False)
+    )
+    if (
+        allow_shared_native
+        and native is not None
+        and not native_enabled
+        and not explicitly_disabled
+    ):
+        live_native_config = getattr(native, "config", None)
+        if live_native_config is not None and live_native_config.enabled:
+            native_enabled = True
+            resolved_native_config = live_native_config
     # Preserve DeliveryRouter's historical support for explicitly supplied live
     # adapters with no config block, but never let an explicitly disabled native
     # adapter shadow an enabled Relay transport.
-    if native is not None and (native_config is None or native_config.enabled):
+    if native is not None and native_enabled:
         return DeliveryTransport(
             adapter=native,
-            config=native_config,
+            config=resolved_native_config,
             transport_platform=platform,
         )
 
@@ -300,7 +329,8 @@ class DeliveryRouter:
     """
     
     def __init__(self, config: GatewayConfig, adapters: Dict[Platform, Any] = None,
-                 dead_targets: Optional[DeadTargetRegistry] = None):
+                 dead_targets: Optional[DeadTargetRegistry] = None, *,
+                 allow_shared_native_transport: bool = False):
         """
         Initialize the delivery router.
         
@@ -309,9 +339,13 @@ class DeliveryRouter:
             adapters: Dict mapping platforms to their adapter instances
             dead_targets: Optional shared registry of confirmed-unreachable
                 targets.  When omitted, a profile-local registry is created.
+            allow_shared_native_transport: Allow a multiplex cron profile to
+                use a connected primary-gateway adapter without duplicating
+                that adapter's credential into the profile secret scope.
         """
         self.config = config
         self.adapters = adapters or {}
+        self.allow_shared_native_transport = allow_shared_native_transport
         self.output_dir = get_hermes_home() / "cron" / "output"
         self.dead_targets = dead_targets or DeadTargetRegistry()
     
@@ -464,7 +498,12 @@ class DeliveryRouter:
         metadata: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
         """Deliver content to a messaging platform."""
-        transport = resolve_delivery_transport(target.platform, self.config, self.adapters)
+        transport = resolve_delivery_transport(
+            target.platform,
+            self.config,
+            self.adapters,
+            allow_shared_native=self.allow_shared_native_transport,
+        )
         if transport is None:
             raise ValueError(f"No adapter configured for {target.platform.value}")
         adapter = transport.adapter
@@ -640,7 +679,5 @@ class DeliveryRouter:
             if _send_result_failed(result):
                 raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
         return result
-
-
 
 

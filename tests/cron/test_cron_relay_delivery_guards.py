@@ -21,7 +21,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cron import scheduler as sched
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from cron.scheduler import (
     _preflight_check_delivery,
     _resolve_single_delivery_target,
@@ -110,6 +110,44 @@ def _gateway_config(connected_values):
 
 
 class TestPreflightRelayFronted:
+    def test_multiplex_profile_accepts_primary_live_discord_adapter(self, monkeypatch):
+        """A credentialless profile may use the gateway's shared live adapter."""
+        monkeypatch.delenv("GATEWAY_RELAY_PLATFORMS", raising=False)
+        profile_config = GatewayConfig(
+            platforms={Platform.DISCORD: PlatformConfig(enabled=False)},
+        )
+        live_discord = MagicMock()
+        live_discord.config = PlatformConfig(enabled=True, token="primary-token")
+
+        with patch("gateway.config.load_gateway_config", return_value=profile_config):
+            assert _preflight_check_delivery(
+                {"deliver": "discord:1540773141171933304"},
+                adapters={Platform.DISCORD: live_discord},
+            ) is None
+
+    def test_multiplex_profile_preserves_explicit_discord_disable(self, monkeypatch):
+        """An explicit profile disable wins over a connected shared adapter."""
+        monkeypatch.delenv("GATEWAY_RELAY_PLATFORMS", raising=False)
+        profile_config = GatewayConfig(
+            platforms={
+                Platform.DISCORD: PlatformConfig(
+                    enabled=False,
+                    extra={"_enabled_explicit": True},
+                ),
+            },
+        )
+        live_discord = MagicMock()
+        live_discord.config = PlatformConfig(enabled=True, token="primary-token")
+
+        with patch("gateway.config.load_gateway_config", return_value=profile_config):
+            error = _preflight_check_delivery(
+                {"deliver": "discord:1540773141171933304"},
+                adapters={Platform.DISCORD: live_discord},
+            )
+
+        assert error is not None
+        assert "has no gateway credentials configured" in error
+
     def test_shared_live_discord_adapter_accepted(self, monkeypatch):
         """A multiplex profile can deliver through the primary live adapter."""
         monkeypatch.delenv("GATEWAY_RELAY_PLATFORMS", raising=False)
