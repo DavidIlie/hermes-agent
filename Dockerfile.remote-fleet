@@ -23,3 +23,7 @@ COPY --chown=root:root --chmod=0644 tools/mcp_tool_provenance.py /opt/hermes/too
 COPY --chown=root:root --chmod=0644 tools/mcp_tool_registration.py /opt/hermes/tools/mcp_tool_registration.py
 COPY --chown=root:root --chmod=0644 tools/mcp_tool_schema.py /opt/hermes/tools/mcp_tool_schema.py
 COPY --chown=root:root --chmod=0644 tools/slash_confirm.py /opt/hermes/tools/slash_confirm.py
+
+ARG HERMES_GIT_SHA
+RUN test -n "$HERMES_GIT_SHA" && printf '%s\n' "$HERMES_GIT_SHA" > /opt/hermes/.hermes_build_sha
+LABEL org.opencontainers.image.revision=$HERMES_GIT_SHA
