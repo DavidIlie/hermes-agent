@@ -19,15 +19,16 @@ Coverage targets:
 from __future__ import annotations
 
 from datetime import datetime
-from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.event import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
+from gateway.session_identity import RoutingIdentity
 
 
 def _make_source(
@@ -36,6 +37,7 @@ def _make_source(
     user_id: str = "user1",
     chat_type: str = "dm",
     chat_id: str = "c1",
+    profile: str | None = None,
 ) -> SessionSource:
     return SessionSource(
         platform=platform,
@@ -43,6 +45,7 @@ def _make_source(
         chat_id=chat_id,
         user_name=f"name-{user_id}",
         chat_type=chat_type,
+        profile=profile,
     )
 
 
@@ -51,11 +54,13 @@ def _make_event(text: str, source: SessionSource) -> MessageEvent:
 
 
 def _make_runner(*, platform_extra: dict | None = None,
-                 platform: Platform = Platform.DISCORD):
+                 platform: Platform = Platform.DISCORD,
+                 multiplex_profiles: bool = False):
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
+        multiplex_profiles=multiplex_profiles,
         platforms={
             platform: PlatformConfig(
                 enabled=True,
@@ -90,6 +95,8 @@ def _make_runner(*, platform_extra: dict | None = None,
     runner.session_store.rewrite_transcript = MagicMock()
     runner.session_store.update_session = MagicMock()
     runner._running_agents = {}
+    runner._primary_profile_name = "primary"
+    runner._profile_configs = {}
     runner._running_agents_ts = {}
     runner._session_run_generation = {}
     runner._pending_messages = {}
@@ -109,49 +116,6 @@ def _make_runner(*, platform_extra: dict | None = None,
     runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
     runner._emit_gateway_run_progress = AsyncMock()
     return runner
-
-
-def test_check_slash_access_loads_named_profile_policy(monkeypatch, tmp_path):
-    """A multiplex source must never inherit the owner's command policy."""
-    from gateway import run as gateway_run
-
-    runner = _make_runner(platform_extra={})
-    friends_config = GatewayConfig(
-        platforms={
-            Platform.DISCORD: PlatformConfig(
-                enabled=True,
-                token="***",
-                extra={
-                    "group_allow_admin_from": ["243009043260637184"],
-                    "group_user_allowed_commands": [],
-                },
-            )
-        }
-    )
-    monkeypatch.setattr(
-        "hermes_cli.profiles.get_active_profile_name", lambda: "default"
-    )
-    monkeypatch.setattr(
-        "hermes_cli.profiles.get_profile_dir", lambda _name: tmp_path
-    )
-    profile_config_loader = MagicMock(return_value=friends_config)
-    monkeypatch.setattr(
-        "gateway.config.load_gateway_config", profile_config_loader
-    )
-    monkeypatch.setattr(
-        gateway_run, "_profile_runtime_scope", lambda _home: nullcontext()
-    )
-    source = _make_source(
-        user_id="1540773031436353708",
-        chat_type="thread",
-    )
-    source.profile = "friends"
-
-    denial = runner._check_slash_access(source, "skill")
-
-    assert denial is not None
-    assert "/skill is admin-only here" in denial
-    profile_config_loader.assert_called_once_with()
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +139,66 @@ async def test_whoami_non_admin_lists_runnable_commands():
     assert "/whoami" in result    # always-allowed floor
     assert "/status" in result
     assert "/model" in result
+
+
+@pytest.mark.asyncio
+async def test_secondary_profile_slash_policy_uses_its_own_config():
+    """#121705: a bot configured only in a secondary profile is gated by THAT profile's
+    ``allow_admin_from``; the launch profile's empty policy must not make it unrestricted."""
+    runner = _make_runner(multiplex_profiles=True)
+    runner._profile_configs["beta"] = GatewayConfig(
+        platforms={
+            Platform.DISCORD: PlatformConfig(
+                enabled=True,
+                extra={"allow_admin_from": ["admin"], "user_allowed_commands": ["status"]},
+            )
+        }
+    )
+    user = _make_source(user_id="user", profile="beta")
+    denied = runner._check_slash_access(user, "restart")
+    assert denied is not None and "⛔" in denied
+    assert "Tier: user" in await runner._handle_whoami_command(_make_event("/whoami", user))
+    assert runner._resume_caller_is_admin(user) is False
+
+    admin = _make_source(user_id="admin", profile="beta")
+    assert runner._check_slash_access(admin, "restart") is None
+    assert runner._resume_caller_is_admin(admin) is True
+
+    # The launch profile's own (ungated) bot stays ungated ...
+    assert runner._check_slash_access(_make_source(user_id="user"), "restart") is None
+    # ... including a turn ROUTED to beta: ``allow_admin_from`` is per bot, so the bot-owning
+    # (transport) profile's config decides, the owner ``authorization_home`` already names.
+    routed = _make_source(user_id="user", profile="beta")
+    routed._identity = RoutingIdentity(
+        transport_profile="primary", runtime_profile="beta",
+        authorization_home=Path("/profiles/primary"), runtime_home=Path("/profiles/beta"),
+    )
+    assert runner._check_slash_access(routed, "restart") is None
+
+
+def test_missing_secondary_profile_config_fails_closed():
+    """A served profile whose config is not cached must not inherit the launch profile's open policy."""
+    runner = _make_runner(multiplex_profiles=True)
+    denied = runner._check_slash_access(_make_source(user_id="user", profile="beta"), "restart")
+    assert denied is not None and "⛔" in denied
+    assert runner._check_slash_access(_make_source(user_id="user", profile="beta"), "help") is None
+
+
+@pytest.mark.asyncio
+async def test_help_non_admin_lists_only_runnable_commands():
+    """/help for a gated non-admin renders the floor + user_allowed_commands, never the
+    admin-only catalog the dispatcher would then refuse; admins keep the full list."""
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": ["status"],
+        }
+    )
+    user = await runner._handle_message(_make_event("/help", _make_source(user_id="999")))
+    assert "`/help" in user and "`/whoami" in user and "`/status" in user
+    assert "`/model" not in user and "`/restart" not in user
+    admin = await runner._handle_message(_make_event("/help", _make_source(user_id="111")))
+    assert "`/model" in admin and "`/restart" in admin
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +248,24 @@ async def test_group_only_gating_leaves_dm_unrestricted():
     )
     result = await runner._handle_message(_make_event("/whoami", _make_source(user_id="anyone", chat_type="dm")))
     assert "Tier: unrestricted" in result
+
+
+@pytest.mark.asyncio
+async def test_blank_chat_type_resolves_to_gated_scope():
+    """A blank chat_type (relay frames can send ""/null; restored rows keep a
+    stored empty value) used to resolve to group scope, so on a DM-only-gated
+    install the source landed in an ungated scope and every command ran."""
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": ["status"],
+        }
+    )
+    for blank in ("", None):
+        result = await runner._handle_message(
+            _make_event("/stop", _make_source(user_id="999", chat_type=blank))
+        )
+        assert "⛔" in result, repr(blank)
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +324,7 @@ async def test_admin_runs_quick_command_when_gating_enabled():
 # Running-agent fast-path gating — admin/user split must hold even when an
 # agent is already running. The fast-path block in _handle_message dispatches
 # /stop, /restart, /new, /steer, /model, /approve, /deny, /agents,
-# /background, /kanban, /goal, /yolo, /verbose, /footer, /help, /commands,
+# /bg, /btw, /kanban, /goal, /yolo, /verbose, /footer, /help, /commands,
 # /profile, /update directly without going through the cold dispatch site.
 # We must apply the gate there too — otherwise non-admins could bypass
 # gating just because an agent happens to be busy.

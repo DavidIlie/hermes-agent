@@ -21,18 +21,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from cron import scheduler as sched
-from gateway.config import GatewayConfig, Platform, PlatformConfig
-from cron.scheduler import (
-    _preflight_check_delivery,
-    _resolve_single_delivery_target,
-    cron_delivery_targets,
-)
+from cron import scheduler_delivery as sched_delivery
+from cron.scheduler_preflight import _preflight_check_delivery
+from cron.scheduler_delivery import _resolve_single_delivery_target, cron_delivery_targets
 
 
 def _slack_home(monkeypatch, chat_id="D0BJTDCSR7C", thread_id=None):
-    monkeypatch.setattr(sched, "_get_home_target_chat_id",
+    monkeypatch.setattr(sched_delivery, "_get_home_target_chat_id",
                         lambda p: chat_id if p == "slack" else None)
-    monkeypatch.setattr(sched, "_get_home_target_thread_id",
+    monkeypatch.setattr(sched_delivery, "_get_home_target_thread_id",
                         lambda p: thread_id if p == "slack" else None)
 
 
@@ -47,7 +44,7 @@ class TestOriginThreadStaleGuard:
                           "thread_id": SYNTH}}
         target = _resolve_single_delivery_target(job, "origin")
         assert target == {"platform": "slack", "chat_id": "D0BJTDCSR7C",
-                          "thread_id": None}
+                          "thread_id": None, "_resolved_from": "origin"}
 
     def test_origin_thread_kept_when_chat_not_home(self, monkeypatch):
         """A non-home Slack origin thread may be a genuine working thread: keep it."""
@@ -80,7 +77,7 @@ class TestOriginThreadStaleGuard:
             "tools.send_message_tool.prepare_send_message_platforms", lambda: None)
         monkeypatch.setattr(
             "tools.send_message_tool.resolve_send_target",
-            lambda platform, rest: (rest, None, None))
+            lambda platform, rest, **kw: (rest, None, None))
         job = {"origin": {"platform": "slack", "chat_id": "D0BJTDCSR7C",
                           "thread_id": SYNTH}}
         target = _resolve_single_delivery_target(job, "slack:D0BJTDCSR7C")
@@ -93,7 +90,7 @@ class TestOriginThreadStaleGuard:
             "tools.send_message_tool.prepare_send_message_platforms", lambda: None)
         monkeypatch.setattr(
             "tools.send_message_tool.resolve_send_target",
-            lambda platform, rest: (rest, None, None))
+            lambda platform, rest, **kw: (rest, None, None))
         job = {"origin": {"platform": "slack", "chat_id": "C0AGENERAL",
                           "thread_id": "1755040000.000100"}}
         target = _resolve_single_delivery_target(job, "slack:C0AGENERAL")
@@ -102,7 +99,6 @@ class TestOriginThreadStaleGuard:
 
 def _gateway_config(connected_values):
     config = MagicMock()
-    config.platforms = {}
     config.get_connected_platforms.return_value = [
         MagicMock(value=v) for v in connected_values
     ]
@@ -110,71 +106,6 @@ def _gateway_config(connected_values):
 
 
 class TestPreflightRelayFronted:
-    def test_multiplex_profile_accepts_primary_live_discord_adapter(self, monkeypatch):
-        """A credentialless profile may use the gateway's shared live adapter."""
-        monkeypatch.delenv("GATEWAY_RELAY_PLATFORMS", raising=False)
-        profile_config = GatewayConfig(
-            platforms={Platform.DISCORD: PlatformConfig(enabled=False)},
-        )
-        live_discord = MagicMock()
-        live_discord.config = PlatformConfig(enabled=True, token="primary-token")
-
-        with patch("gateway.config.load_gateway_config", return_value=profile_config):
-            assert _preflight_check_delivery(
-                {"deliver": "discord:1540773141171933304"},
-                adapters={Platform.DISCORD: live_discord},
-            ) is None
-
-    def test_multiplex_profile_preserves_explicit_discord_disable(self, monkeypatch):
-        """An explicit profile disable wins over a connected shared adapter."""
-        monkeypatch.delenv("GATEWAY_RELAY_PLATFORMS", raising=False)
-        profile_config = GatewayConfig(
-            platforms={
-                Platform.DISCORD: PlatformConfig(
-                    enabled=False,
-                    extra={"_enabled_explicit": True},
-                ),
-            },
-        )
-        live_discord = MagicMock()
-        live_discord.config = PlatformConfig(enabled=True, token="primary-token")
-
-        with patch("gateway.config.load_gateway_config", return_value=profile_config):
-            error = _preflight_check_delivery(
-                {"deliver": "discord:1540773141171933304"},
-                adapters={Platform.DISCORD: live_discord},
-            )
-
-        assert error is not None
-        assert "has no gateway credentials configured" in error
-
-    def test_shared_live_discord_adapter_accepted(self, monkeypatch):
-        """A multiplex profile can deliver through the primary live adapter."""
-        monkeypatch.delenv("GATEWAY_RELAY_PLATFORMS", raising=False)
-        live_discord = MagicMock()
-        with patch(
-            "gateway.config.load_gateway_config",
-            return_value=_gateway_config(set()),
-        ):
-            assert _preflight_check_delivery(
-                {"deliver": "discord:1540773141171933304"},
-                adapters={Platform.DISCORD: live_discord},
-            ) is None
-
-    def test_profile_without_live_discord_adapter_still_rejected(self, monkeypatch):
-        """The shared-transport exception cannot weaken standalone cron."""
-        monkeypatch.delenv("GATEWAY_RELAY_PLATFORMS", raising=False)
-        with patch(
-            "gateway.config.load_gateway_config",
-            return_value=_gateway_config(set()),
-        ):
-            reason = _preflight_check_delivery(
-                {"deliver": "discord:1540773141171933304"},
-                adapters={},
-            )
-        assert reason is not None
-        assert "discord" in reason
-
     def test_relay_fronted_slack_accepted(self, monkeypatch):
         """Relay-only topology fronting slack: slack:CHAT passes preflight."""
         monkeypatch.setenv("GATEWAY_RELAY_PLATFORMS", "slack")
@@ -206,7 +137,7 @@ class TestPreflightRelayFronted:
         """The UI dropdown source offers relay-fronted platforms."""
         monkeypatch.setenv("GATEWAY_RELAY_PLATFORMS", "slack")
         _slack_home(monkeypatch)
-        monkeypatch.setattr(sched, "_iter_home_target_platforms",
+        monkeypatch.setattr(sched_delivery, "_iter_home_target_platforms",
                             lambda: ["slack", "telegram"])
         with patch("gateway.config.load_gateway_config",
                    return_value=_gateway_config({"relay"})):

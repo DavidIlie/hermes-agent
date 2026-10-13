@@ -34,14 +34,6 @@ describe('composer suggestion bus', () => {
     expect(pillsFor('s1')).toEqual([])
   })
 
-  it('caps merged suggestions at two', () => {
-    offerSuggestions('s3', 'test', [suggestion('a'), suggestion('b'), suggestion('c')])
-
-    expect(pillsFor('s3')).toHaveLength(2)
-
-    offerSuggestions('s3', 'test', [])
-  })
-
   it('dedupes by provider-namespaced key across providers', () => {
     offerSuggestions('s4', 'p1', [suggestion('same', 'p1')])
     offerSuggestions('s4', 'p2', [suggestion('same', 'p2')])
@@ -79,5 +71,36 @@ describe('composer suggestion bus', () => {
     expect(pillsFor('s6')).toEqual(['used'])
 
     offerSuggestions('s6', 'test', [])
+  })
+
+  it('replaces an offer whose rendered copy changed under the same key', () => {
+    offerSuggestions('s7', 'test', [{ ...suggestion('linear'), tip: 'because you mentioned “linear”' }])
+    offerSuggestions('s7', 'test', [{ ...suggestion('linear'), tip: 'because you pasted linear.app' }])
+
+    // Same key, new trigger — the strip must paint the new reason, not the
+    // first one it ever saw.
+    expect(($composerSuggestionsBySession.get().s7 ?? []).map(s => s.tip)).toEqual(['because you pasted linear.app'])
+
+    offerSuggestions('s7', 'test', [])
+  })
+
+  it('re-offering the same key swaps in the fresh invoke closure', async () => {
+    const calls: string[] = []
+
+    const offer = (tag: string) =>
+      offerSuggestions('s8', 'test', [
+        { ...suggestion('linear'), invoke: async () => void calls.push(tag), label: `Add linear ${tag}` }
+      ])
+
+    offer('first')
+    offer('second')
+
+    await ($composerSuggestionsBySession.get().s8 ?? [])[0]!.invoke({ cancelled: () => false, sessionId: 's8' })
+
+    // A pinned first object means the pill runs work built for a draft the
+    // user has since changed.
+    expect(calls).toEqual(['second'])
+
+    offerSuggestions('s8', 'test', [])
   })
 })

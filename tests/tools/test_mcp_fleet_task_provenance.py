@@ -11,7 +11,7 @@ from gateway.config import Platform
 from gateway.run import GatewayRunner
 from gateway.session import SessionContext, SessionSource
 from gateway.session_context import reset_session_vars, set_session_vars
-from tools import mcp_tool
+from tools import mcp_tool, mcp_tool_handlers, mcp_tool_schema, mcp_tool_provenance
 
 
 def _run_on_mcp_loop(coro_or_factory, timeout=30):
@@ -51,9 +51,9 @@ def task_start_call():
     )
     server = SimpleNamespace(session=session, _rpc_lock=None)
     with patch.dict(mcp_tool._servers, {"fleet_tasks": server}), patch(
-        "tools.mcp_tool._run_on_mcp_loop", side_effect=_run_on_mcp_loop
+        "tools.mcp_tool_loop._run_on_mcp_loop", side_effect=_run_on_mcp_loop
     ), patch.dict(mcp_tool._server_error_counts, {}, clear=True):
-        yield session, mcp_tool._make_tool_handler(
+        yield session, mcp_tool_handlers._make_tool_handler(
             "fleet_tasks", "task_start", 30.0
         )
 
@@ -72,9 +72,9 @@ def friend_task_call():
     with patch.dict(
         mcp_tool._servers, {"friends_public_code": server}
     ), patch(
-        "tools.mcp_tool._run_on_mcp_loop", side_effect=_run_on_mcp_loop
+        "tools.mcp_tool_loop._run_on_mcp_loop", side_effect=_run_on_mcp_loop
     ), patch.dict(mcp_tool._server_error_counts, {}, clear=True):
-        yield session, mcp_tool._make_tool_handler(
+        yield session, mcp_tool_handlers._make_tool_handler(
             "friends_public_code",
             "friend_task_request",
             30.0,
@@ -328,9 +328,9 @@ def test_reserved_provenance_is_hidden_from_model_schema():
         },
     )
 
-    assert mcp_tool._mcp_tool_accepts_transport_provenance(tool) is True
-    assert mcp_tool._mcp_tool_requires_transport_provenance(tool) is True
-    schema = mcp_tool._convert_mcp_schema("friends_public_code", tool)
+    assert mcp_tool_provenance._mcp_tool_accepts_transport_provenance(tool) is True
+    assert mcp_tool_provenance._mcp_tool_requires_transport_provenance(tool) is True
+    schema = mcp_tool_schema._convert_mcp_schema("friends_public_code", tool)
     assert schema["parameters"]["properties"] == {
         "request": {"type": "string"}
     }

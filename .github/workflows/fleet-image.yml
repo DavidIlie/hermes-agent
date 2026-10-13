@@ -33,7 +33,7 @@ jobs:
           set -Eeuo pipefail
           short_sha="${GITHUB_SHA:0:10}"
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/hermes-agent-fleet"
-          tag="v2026.8.22-friends.${short_sha}"
+          tag="v0.21.7-fleet.${short_sha}"
           printf 'image=%s\n' "$image" >>"$GITHUB_OUTPUT"
           printf 'tag=%s\n' "$tag" >>"$GITHUB_OUTPUT"
 
@@ -42,7 +42,7 @@ jobs:
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f
         with:
           context: .
-          file: Dockerfile
+          file: Dockerfile.remote-fleet
           platforms: linux/amd64
           push: true
           tags: ${{ steps.image.outputs.image }}:${{ steps.image.outputs.tag }}

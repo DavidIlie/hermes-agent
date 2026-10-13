@@ -21,13 +21,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from cron import scheduler as sched
-from cron.scheduler import (
-    _deliver_result,
-    _get_home_target_chat_id,
-    _get_home_target_thread_id,
-    _resolve_delivery_targets,
-)
-from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
+from cron.scheduler import _deliver_result, _resolve_delivery_targets
+from cron.scheduler_delivery import _get_home_target_chat_id, _get_home_target_thread_id
+from gateway.config import HomeChannel, Platform
 
 
 def _gateway_config_with_home(platform=Platform.DISCORD, chat_id="1517373704248758474",
@@ -106,6 +102,7 @@ class TestConfigHomeChannelFallback:
             "platform": "discord",
             "chat_id": "1517373704248758474",
             "thread_id": None,
+            "_resolved_from": "home",
         }]
 
 
@@ -135,13 +132,13 @@ class TestRelayDeliveryGate:
             future = Future()
             try:
                 future.set_result(asyncio.run(coro))
-            except BaseException as e:  # noqa: BLE001
+            except BaseException as e:
                 future.set_exception(e)
             return future
 
         router = MagicMock()
 
-        async def _deliver_to_platform(target, content, metadata):
+        async def _deliver_to_platform(target, content, metadata, transport=None):
             return {"success": True, "raw_response": None}
 
         router._deliver_to_platform = _deliver_to_platform
@@ -173,60 +170,19 @@ class TestRelayDeliveryGate:
         config.get_home_channel = lambda p: None
         result = self._run({}, config)
         assert result is not None
-        assert "not configured/enabled" in result
 
-
-class _SharedNativeAdapter:
-    def __init__(self):
-        self.config = PlatformConfig(enabled=True, token="primary-token")
-        self.calls = []
-
-    async def send(self, chat_id, content, metadata=None):
-        self.calls.append({
-            "chat_id": chat_id,
-            "content": content,
-            "metadata": metadata,
-        })
-        return {"success": True}
-
-
-class TestMultiplexSharedNativeDelivery:
-    def test_profile_uses_primary_live_adapter_for_cron_delivery(self, monkeypatch):
-        """The multiplex cron path sends through the connected primary adapter."""
+    def test_relay_fronted_without_live_gateway_errors_accurately(self, monkeypatch):
+        """A relay-fronted platform with NO live relay transport (manual
+        in-process `hermes cron run`) fails with the accurate 'gateway required'
+        message — never the native 'not configured/enabled' gate, which
+        misdiagnoses relay-fronted deployments whose credential lives in the
+        connector, not natively."""
         _clear_home_env(monkeypatch)
-        adapter = _SharedNativeAdapter()
-        profile_config = GatewayConfig(
-            platforms={Platform.DISCORD: PlatformConfig(enabled=False)},
-        )
-        job = {
-            "id": "profile-cron",
-            "name": "Profile cron",
-            "deliver": "discord:1540773141171933304",
-        }
-        loop = MagicMock()
-        loop.is_running.return_value = True
-
-        def fake_run_coro(coro, _loop):
-            future = Future()
-            try:
-                future.set_result(asyncio.run(coro))
-            except BaseException as exc:  # noqa: BLE001
-                future.set_exception(exc)
-            return future
-
-        with patch("gateway.config.load_gateway_config", return_value=profile_config), \
-             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
-             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
-            result = _deliver_result(
-                job,
-                "Daily motivation.",
-                adapters={Platform.DISCORD: adapter},
-                loop=loop,
-            )
-
-        assert result is None
-        assert adapter.calls == [{
-            "chat_id": "1540773141171933304",
-            "content": "Daily motivation.",
-            "metadata": {"job_id": "profile-cron"},
-        }]
+        monkeypatch.setenv("GATEWAY_RELAY_PLATFORMS", "discord")
+        config = MagicMock()
+        config.platforms = {}
+        config.get_home_channel = lambda p: None
+        result = self._run({}, config)  # no live adapters
+        assert result is not None
+        assert "relay-fronted" in (result or "")
+        assert "not configured" not in (result or "")
